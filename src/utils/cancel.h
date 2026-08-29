@@ -30,6 +30,7 @@ struct Base {
   virtual ~Base() = default;
   virtual bool IsCancelled() = 0;
   virtual void Cancel() = 0;
+  virtual uint64_t RemainingTimeoutMs() const = 0;
 };
 
 using Token = std::shared_ptr<Base>;

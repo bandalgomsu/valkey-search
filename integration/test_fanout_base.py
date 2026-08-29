@@ -7,10 +7,85 @@ from valkey.exceptions import ResponseError, ConnectionError
 import pytest
 from indexes import *
 from ft_info_parser import FTInfoParser
+from utils import find_local_key
 
 MAX_RETRIES = "4294967295"
 
 class TestFanoutBase(ValkeySearchClusterTestCaseDebugMode):
+
+    def test_aggressive_content_fetch_retries_skewed_distribution(self):
+        cluster: ValkeyCluster = self.new_cluster_client()
+        coordinator: Valkey = self.new_client_for_primary(0)
+        target: Valkey = self.new_client_for_primary(1)
+        index_name = "content_fetch_idx"
+
+        assert coordinator.execute_command(
+            "FT.CREATE", index_name,
+            "ON", "HASH",
+            "PREFIX", "1", "doc:",
+            "SCHEMA", "price", "NUMERIC", "payload", "TAG"
+        ) == b"OK"
+        for node in self.get_nodes():
+            waiters.wait_for_true(lambda node=node: index_on_node(node.client, index_name))
+
+        # Put every matching document on one shard. With three shards and K=6,
+        # aggressive mode initially fetches content for only ceil(6/3)=2
+        # candidates, forcing the coordinator's full-content retry.
+        for i in range(6):
+            key = find_local_key(target, prefix=f"doc:content-fetch:{i}:")
+            cluster.execute_command(
+                "HSET", key, "price", str(i), "payload", f"payload-{i}"
+            )
+
+        waiters.wait_for_true(
+            lambda: coordinator.execute_command(
+                "FT.SEARCH", index_name, "@price:[0 5]", "NOCONTENT",
+                "LIMIT", "0", "10"
+            )[0] == 6
+        )
+
+        assert coordinator.execute_command(
+            "CONFIG", "SET", "search.fanout-content-fetch-mode", "disabled"
+        ) == b"OK"
+        expected = coordinator.execute_command(
+            "FT.SEARCH", index_name, "@price:[0 5]", "LIMIT", "0", "6"
+        )
+
+        retry_count_before = coordinator.info("search").get(
+            "search_fanout_content_fetch_retry_count", 0
+        )
+
+        assert coordinator.execute_command(
+            "CONFIG", "SET", "search.fanout-content-fetch-mode", "aggressive"
+        ) == b"OK"
+        actual = coordinator.execute_command(
+            "FT.SEARCH", index_name, "@price:[0 5]", "LIMIT", "0", "6"
+        )
+
+        retry_count_after = coordinator.info("search").get(
+            "search_fanout_content_fetch_retry_count", 0
+        )
+
+        def normalize(result):
+            return result[0], [
+                (result[i], dict(zip(result[i + 1][::2], result[i + 1][1::2])))
+                for i in range(1, len(result), 2)
+            ]
+
+        assert normalize(actual) == normalize(expected)
+        assert len(actual) == 13
+        assert retry_count_after == retry_count_before + 1
+
+        # SORTBY requires content for global ranking and must bypass the
+        # optimization even when aggressive mode is configured.
+        sorted_result = coordinator.execute_command(
+            "FT.SEARCH", index_name, "@price:[0 5]", "SORTBY", "price",
+            "DESC", "LIMIT", "0", "6"
+        )
+        assert sorted_result[0] == 6
+        assert coordinator.info("search").get(
+            "search_fanout_content_fetch_retry_count", 0
+        ) == retry_count_after
 
     # force retry by manually creating remote failure once
     def test_fanout_retry(self):

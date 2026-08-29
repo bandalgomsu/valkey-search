@@ -15,6 +15,12 @@ namespace options {
 
 namespace config = vmsdk::config;
 
+enum class FanoutContentFetchMode {
+  kDisabled = 0,
+  kConservative = 1,
+  kAggressive = 2,
+};
+
 /// Return the value of the Query String Bytes configuration
 uint32_t GetQueryStringBytes();
 
@@ -120,11 +126,8 @@ const config::Boolean &GetDrainMutationQueueOnSave();
 /// Return the configuration entry for draining mutation queue on load
 const config::Boolean &GetDrainMutationQueueOnLoad();
 
-/// Return the fanout data uniformity configuration (0-100)
-config::Number &GetFanoutDataUniformity();
-
-/// Return the minimum index size for applying fanout uniformity logic
-config::Number &GetFanoutUniformityMinIndexSize();
+/// Return the fanout content fetch optimization mode.
+config::Enum &GetFanoutContentFetchMode();
 
 /// Return the configuration entry for max mutation queue size during restore
 config::Number &GetMaxMutationQueueSizeOnRestore();

@@ -297,6 +297,37 @@ TEST_F(ResponseGeneratorTest, ProcessNeighborsForReplyContentLimits) {
   EXPECT_EQ(Metrics::GetStats().query_result_record_dropped_cnt, 2);
 }
 
+TEST_F(ResponseGeneratorTest, PreservesCandidatesBeyondFanoutContentLimit) {
+  ValkeyModuleCtx fake_ctx;
+  UnitTestSearchParameters parameters;
+  parameters.content_limit = 1;
+
+  std::vector<indexes::Neighbor> neighbors;
+  for (auto [key, distance] :
+       {std::pair<absl::string_view, float>{"first", 2.0f},
+        {"second", 1.0f}}) {
+    RecordsMap contents;
+    contents.emplace("field",
+                     RecordsMapValue(vmsdk::MakeUniqueValkeyString("field"),
+                                     vmsdk::MakeUniqueValkeyString("value")));
+    neighbors.emplace_back(StringInternStore::Intern(key), distance,
+                           std::make_optional(std::move(contents)));
+  }
+
+  MockAttributeDataType data_type;
+  query::ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                                  std::nullopt);
+
+  ASSERT_EQ(neighbors.size(), 2);
+  for (const auto &neighbor : neighbors) {
+    if (neighbor.external_id->Str() == "second") {
+      EXPECT_TRUE(neighbor.attribute_contents.has_value());
+    } else {
+      EXPECT_FALSE(neighbor.attribute_contents.has_value());
+    }
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     ResponseGeneratorTests, ResponseGeneratorTest,
     ValuesIn<ResponseGeneratorTestCase>(

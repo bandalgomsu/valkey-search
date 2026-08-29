@@ -25,6 +25,7 @@
 #include "src/indexes/text/text_index.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
+#include "src/query/neighbor_comparator.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
 #include "src/valkey_search.h"
@@ -385,7 +386,26 @@ void ProcessNeighborsForReply(
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =
       options::GetMaxSearchResultFieldsCount().GetValue();
-  for (auto &neighbor : neighbors) {
+  const size_t content_limit =
+      parameters.content_limit.has_value()
+          ? std::min<uint64_t>(*parameters.content_limit, neighbors.size())
+          : neighbors.size();
+
+  // Index iterators do not provide one common ordering across query types.
+  // Select the content candidates using the same ordering as fanout merge.
+  if (content_limit < neighbors.size()) {
+    std::partial_sort(neighbors.begin(), neighbors.begin() + content_limit,
+                      neighbors.end(), NeighborComparator{});
+  }
+
+  for (size_t i = 0; i < neighbors.size(); ++i) {
+    auto &neighbor = neighbors[i];
+    if (i >= content_limit) {
+      // Keep the candidate for the coordinator merge, but make the omission
+      // explicit even if some content was materialized from an index.
+      neighbor.attribute_contents = std::nullopt;
+      continue;
+    }
     // Remote neighbors (from fanout) always have attribute_contents populated,
     // so they skip this entire block. Only local neighbors without content
     // reach the slot ownership check below.
@@ -436,13 +456,16 @@ void ProcessNeighborsForReply(
       neighbor.attribute_contents = std::move(content.value());
     }
   }
-  // Remove all entries that don't have content now.
-  // TODO: incorporate a retry in case of removal.
+  // Remove entries in the fetched prefix that failed content resolution. The
+  // intentionally-unfetched suffix remains as key/score-only candidates.
+  size_t index = 0;
   neighbors.erase(
-      std::remove_if(neighbors.begin(), neighbors.end(),
-                     [](const indexes::Neighbor &neighbor) {
-                       return !neighbor.attribute_contents.has_value();
-                     }),
+      std::remove_if(
+          neighbors.begin(), neighbors.end(),
+          [&index, content_limit](const indexes::Neighbor &neighbor) {
+            return index++ < content_limit &&
+                   !neighbor.attribute_contents.has_value();
+          }),
       neighbors.end());
 }
 

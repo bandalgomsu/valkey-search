@@ -109,6 +109,8 @@ void SerializeNeighbors(SearchIndexPartitionResponse *response,
         contents->set_identifier(identifier);
         contents->set_content(vmsdk::ToStringView(record.value.get()));
       }
+    } else {
+      neighbor_proto->set_content_omitted(true);
     }
   }
 }

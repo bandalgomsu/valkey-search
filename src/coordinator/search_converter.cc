@@ -236,6 +236,9 @@ absl::Status GRPCSearchRequestToParameters(
   parameters->limit = query::LimitParameter{request.limit().first_index(),
                                             request.limit().number()};
   parameters->no_content = request.no_content();
+  if (request.has_content_limit()) {
+    parameters->content_limit = request.content_limit();
+  }
   parameters->enable_partial_results = request.enable_partial_results();
   parameters->enable_consistency = request.enable_consistency();
   if (request.has_root_filter_predicate()) {
@@ -389,6 +392,9 @@ std::unique_ptr<SearchIndexPartitionRequest> ParametersToGRPCSearchRequest(
   request->mutable_limit()->set_number(parameters.limit.number);
   request->set_timeout_ms(parameters.timeout_ms);
   request->set_no_content(parameters.no_content);
+  if (parameters.content_limit.has_value()) {
+    request->set_content_limit(*parameters.content_limit);
+  }
   request->set_enable_partial_results(parameters.enable_partial_results);
   request->set_enable_consistency(parameters.enable_consistency);
   if (parameters.filter_parse_results.root_predicate != nullptr) {

@@ -212,6 +212,9 @@ struct SearchParameters {
   LimitParameter limit;
   uint64_t timeout_ms{0};
   bool no_content{false};
+  // Fanout responders resolve content only for this many leading candidates.
+  // An absent value preserves normal full-content behavior.
+  std::optional<uint64_t> content_limit;
   FilterParseResults filter_parse_results;
   std::vector<ReturnAttribute> return_attributes;
   bool inorder{false};

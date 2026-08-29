@@ -14,11 +14,15 @@
 #include "absl/status/status.h"
 #include "src/coordinator/client_pool.h"
 #include "src/query/search.h"
+#include "src/valkey_search_options.h"
 #include "vmsdk/src/cluster_map.h"
 #include "vmsdk/src/thread_pool.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 namespace valkey_search::query::fanout {
+
+uint64_t EstimateContentLimit(uint64_t candidate_limit, size_t shard_count,
+                              options::FanoutContentFetchMode mode);
 
 absl::Status PerformSearchFanoutAsync(
     ValkeyModuleCtx* ctx,

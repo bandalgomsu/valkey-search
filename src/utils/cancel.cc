@@ -36,6 +36,14 @@ struct TokenImpl : public Base {
     is_cancelled_ = true;  // Once cancelled, stay cancelled
   }
 
+  uint64_t RemainingTimeoutMs() const override {
+    const int64_t now_ms = ValkeyModule_Milliseconds();
+    if (now_ms >= deadline_ms_) {
+      return 0;
+    }
+    return static_cast<uint64_t>(deadline_ms_ - now_ms);
+  }
+
   bool IsCancelled() override {
     if (++count_ > TimeoutPollFrequency.GetValue()) {
       count_ = 0;

@@ -144,12 +144,14 @@ message SearchIndexPartitionRequest {
   uint64 slot_fingerprint = 17;
   uint64 query_operations = 18;
   optional SortByParameter sortby = 19;
+  optional uint64 content_limit = 20;
 }
 
 message NeighborEntry {
   string key = 1;
   float score = 2;
   repeated AttributeContentEntry attribute_contents = 3;
+  bool content_omitted = 4;
 }
 
 message SearchIndexPartitionResponse {

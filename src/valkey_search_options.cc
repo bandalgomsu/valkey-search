@@ -430,37 +430,23 @@ constexpr absl::string_view kDrainMutationQueueOnSaveConfig{
 static auto drain_mutation_queue_on_save =
     config::BooleanBuilder(kDrainMutationQueueOnSaveConfig, false).Build();
 
-/// Register the "fanout-data-uniformity" flag
-/// U = uniformity (0-100): 100 = uniform distribution, 0 = all data in one
-/// shard Formula: limit_per_shard = ceil(K/N) + ((100-U) * (K - ceil(K/N)) /
-/// 100) Where ceil(K/N) is calculated as (K + N - 1) / N using integer
-/// division. By default, uniformity is disabled (U=0), we assume all data is in
-/// one shard.
-constexpr absl::string_view kFanoutDataUniformityConfig{
-    "fanout-data-uniformity"};
-constexpr uint32_t kDefaultFanoutDataUniformity{0};
-constexpr uint32_t kMinimumFanoutDataUniformity{0};
-constexpr uint32_t kMaximumFanoutDataUniformity{100};
-static auto fanout_data_uniformity =
-    config::NumberBuilder(
-        kFanoutDataUniformityConfig, kDefaultFanoutDataUniformity,
-        kMinimumFanoutDataUniformity, kMaximumFanoutDataUniformity)
-        .Dev()  // can only be set in debug mode
-        .Build();
-
-/// Register the "fanout-uniformity-min-index-size" flag
-/// Minimum index size before applying uniformity logic
-constexpr absl::string_view kFanoutUniformityMinIndexSizeConfig{
-    "fanout-uniformity-min-index-size"};
-constexpr uint32_t kDefaultFanoutUniformityMinIndexSize{10000};
-constexpr uint32_t kMinimumFanoutUniformityMinIndexSize{0};
-constexpr uint32_t kMaximumFanoutUniformityMinIndexSize{UINT32_MAX};
-static auto fanout_uniformity_min_index_size =
-    config::NumberBuilder(kFanoutUniformityMinIndexSizeConfig,
-                          kDefaultFanoutUniformityMinIndexSize,
-                          kMinimumFanoutUniformityMinIndexSize,
-                          kMaximumFanoutUniformityMinIndexSize)
-        .Dev()  // can only be set in debug mode
+/// Controls whether fanout responders omit content from candidates that are
+/// unlikely to survive the coordinator merge. Candidate keys and scores are
+/// always returned, so an underestimated content limit can be detected and
+/// retried without compromising result correctness.
+constexpr absl::string_view kFanoutContentFetchModeConfig{
+    "fanout-content-fetch-mode"};
+static const std::vector<std::string_view> kFanoutContentFetchModeNames = {
+    "disabled", "conservative", "aggressive"};
+static const std::vector<int> kFanoutContentFetchModeValues = {
+    static_cast<int>(FanoutContentFetchMode::kDisabled),
+    static_cast<int>(FanoutContentFetchMode::kConservative),
+    static_cast<int>(FanoutContentFetchMode::kAggressive)};
+static auto fanout_content_fetch_mode =
+    config::EnumBuilder(kFanoutContentFetchModeConfig,
+                        static_cast<int>(FanoutContentFetchMode::kDisabled),
+                        kFanoutContentFetchModeNames,
+                        kFanoutContentFetchModeValues)
         .Build();
 
 /// Register the "--async-fanout-threshold" flag. Controls the threshold
@@ -652,13 +638,8 @@ const vmsdk::config::Boolean &GetDrainMutationQueueOnLoad() {
       *drain_mutation_queue_on_load);
 }
 
-vmsdk::config::Number &GetFanoutDataUniformity() {
-  return dynamic_cast<vmsdk::config::Number &>(*fanout_data_uniformity);
-}
-
-vmsdk::config::Number &GetFanoutUniformityMinIndexSize() {
-  return dynamic_cast<vmsdk::config::Number &>(
-      *fanout_uniformity_min_index_size);
+vmsdk::config::Enum &GetFanoutContentFetchMode() {
+  return dynamic_cast<vmsdk::config::Enum &>(*fanout_content_fetch_mode);
 }
 
 vmsdk::config::Number &GetMaxMutationQueueSizeOnRestore() {

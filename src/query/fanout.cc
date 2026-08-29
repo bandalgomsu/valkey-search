@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -30,7 +31,9 @@
 #include "src/coordinator/search_converter.h"
 #include "src/coordinator/util.h"
 #include "src/indexes/vector_base.h"
+#include "src/query/neighbor_comparator.h"
 #include "src/query/search.h"
+#include "src/utils/cancel.h"
 #include "src/utils/string_interning.h"
 #include "src/valkey_search.h"
 #include "valkey_search_options.h"
@@ -46,22 +49,36 @@
 namespace valkey_search::query::fanout {
 
 CONTROLLED_BOOLEAN(ForceInvalidSlotFingerprint, false);
+DEV_INTEGER_COUNTER(query_stats, fanout_content_fetch_retry_count);
 
-struct NeighborComparator {
-  bool operator()(const indexes::Neighbor &a,
-                  const indexes::Neighbor &b) const {
-    // Primary sort: by distance
-    // We use a max heap, to pop off the furthest vector during aggregation.
-    if (a.distance != b.distance) {
-      return a.distance < b.distance;
-    }
-    // Secondary sort: by key for consistent ordering when distances are equal.
-    // Primarily used in non vector queries without scores (distance = 0).
-    // The full string compare is required because for external keys there is no
-    // guarantee of the stability of the InternedStringPtr across invocations.
-    return a.external_id->Str() > b.external_id->Str();
+uint64_t EstimateContentLimit(uint64_t candidate_limit, size_t shard_count,
+                              options::FanoutContentFetchMode mode) {
+  if (candidate_limit == 0 || shard_count == 0 ||
+      mode == options::FanoutContentFetchMode::kDisabled) {
+    return candidate_limit;
   }
-};
+  const uint64_t shard_count_u64 = static_cast<uint64_t>(shard_count);
+  const uint64_t fair_share = candidate_limit / shard_count_u64 +
+                              (candidate_limit % shard_count_u64 != 0);
+  if (mode == options::FanoutContentFetchMode::kAggressive) {
+    return fair_share;
+  }
+  const uint64_t gap = candidate_limit - fair_share;
+  return candidate_limit - gap / 4;
+}
+
+namespace {
+
+absl::Status PerformSearchFanoutAsyncImpl(
+    ValkeyModuleCtx *ctx,
+    std::vector<vmsdk::cluster_map::NodeInfo> &search_targets,
+    coordinator::ClientPool *coordinator_client_pool,
+    std::unique_ptr<SearchParameters> parameters,
+    vmsdk::ThreadPool *thread_pool, bool force_full_content,
+    std::optional<std::vector<std::optional<uint64_t>>> slot_fingerprints =
+        std::nullopt);
+
+}  // namespace
 
 // SearchPartitionResultsTracker is a thread-safe class that tracks the results
 // of a query fanout. It aggregates the results from multiple nodes and returns
@@ -92,11 +109,15 @@ struct SearchPartitionResultsTracker {
   std::atomic_bool has_node_error{false};       // Whether any node failed
   absl::Status first_node_error
       ABSL_GUARDED_BY(mutex);  // First error encountered
+  std::function<void(std::unique_ptr<SearchParameters>)> content_retry;
 
-  SearchPartitionResultsTracker(int outstanding_requests, int k,
-                                std::unique_ptr<SearchParameters> parameters)
+  SearchPartitionResultsTracker(
+      int outstanding_requests, int k,
+      std::unique_ptr<SearchParameters> parameters,
+      std::function<void(std::unique_ptr<SearchParameters>)> content_retry = {})
       : outstanding_requests(outstanding_requests),
-        parameters(std::move(parameters)) {}
+        parameters(std::move(parameters)),
+        content_retry(std::move(content_retry)) {}
 
   void HandleResponse(coordinator::SearchIndexPartitionResponse &response,
                       const std::string &address, const grpc::Status &status) {
@@ -130,16 +151,20 @@ struct SearchPartitionResultsTracker {
     while (response.neighbors_size() > 0) {
       auto neighbor_entry = std::unique_ptr<coordinator::NeighborEntry>(
           response.mutable_neighbors()->ReleaseLast());
-      RecordsMap attribute_contents;
-      for (const auto &attribute_content :
-           neighbor_entry->attribute_contents()) {
-        auto identifier =
-            vmsdk::MakeUniqueValkeyString(attribute_content.identifier());
-        auto identifier_view = vmsdk::ToStringView(identifier.get());
-        attribute_contents.emplace(
-            identifier_view, RecordsMapValue(std::move(identifier),
-                                             vmsdk::MakeUniqueValkeyString(
-                                                 attribute_content.content())));
+      std::optional<RecordsMap> attribute_contents;
+      if (!neighbor_entry->content_omitted()) {
+        attribute_contents.emplace();
+        for (const auto &attribute_content :
+             neighbor_entry->attribute_contents()) {
+          auto identifier =
+              vmsdk::MakeUniqueValkeyString(attribute_content.identifier());
+          auto identifier_view = vmsdk::ToStringView(identifier.get());
+          attribute_contents->emplace(
+              identifier_view,
+              RecordsMapValue(
+                  std::move(identifier),
+                  vmsdk::MakeUniqueValkeyString(attribute_content.content())));
+        }
       }
       indexes::Neighbor neighbor{
           StringInternStore::Intern(neighbor_entry->key()),
@@ -168,55 +193,82 @@ struct SearchPartitionResultsTracker {
     }
     if (results.size() < parameters->k) {
       results.emplace(std::move(neighbor));
-    } else if (neighbor.distance < results.top().distance) {
+    } else if (NeighborComparator{}(neighbor, results.top())) {
       results.emplace(std::move(neighbor));
       results.pop();
     }
   }
 
   ~SearchPartitionResultsTracker() {
-    absl::MutexLock lock(&mutex);
-    absl::Status status;
-    if (consistency_failed) {
-      // Consistency failures always take precedence
-      status = absl::FailedPreconditionError(kFailedPreconditionMsg);
-    } else if (has_node_error.load() && (!parameters->enable_partial_results ||
-                                         !has_successful_node.load())) {
-      // Use first error when:
-      // - Partial results disabled (any error fails the operation), OR
-      // - Partial results enabled but no nodes succeeded (all failed)
-      status = first_node_error;
-    } else {
-      // No errors detected - success case
-      std::vector<indexes::Neighbor> neighbors;
-      neighbors.resize(results.size());
-      size_t i = neighbors.size();
-      while (!results.empty()) {
-        CHECK(i != 0);
-        neighbors[--i] =
-            std::move(const_cast<indexes::Neighbor &>(results.top()));
-        results.pop();
+    std::unique_ptr<SearchParameters> completed_parameters;
+    std::function<void(std::unique_ptr<SearchParameters>)> retry;
+    {
+      absl::MutexLock lock(&mutex);
+      absl::Status status;
+      if (consistency_failed) {
+        // Consistency failures always take precedence
+        status = absl::FailedPreconditionError(kFailedPreconditionMsg);
+      } else if (has_node_error.load() &&
+                 (!parameters->enable_partial_results ||
+                  !has_successful_node.load())) {
+        // Use first error when:
+        // - Partial results disabled (any error fails the operation), OR
+        // - Partial results enabled but no nodes succeeded (all failed)
+        status = first_node_error;
+      } else {
+        // No errors detected - success case
+        std::vector<indexes::Neighbor> neighbors;
+        neighbors.resize(results.size());
+        size_t i = neighbors.size();
+        while (!results.empty()) {
+          CHECK(i != 0);
+          neighbors[--i] =
+              std::move(const_cast<indexes::Neighbor &>(results.top()));
+          results.pop();
+        }
+        CHECK(i == 0);
+        // Note: We do not sort neighbors here because we do not have the
+        // content of the local shard yet. In the SendReply function, we will
+        // sort the all neighbors based on the content if sorting is required.
+        // SearchResult construction automatically applies trimming based on
+        // LIMIT offset count IF the command allows it (ie - it does not require
+        // complete results).
+        parameters->search_result = SearchResult(
+            accumulated_total_count, std::move(neighbors), *parameters, true);
+        status = absl::OkStatus();
+        if (content_retry) {
+          const auto range =
+              parameters->search_result.GetSerializationRange(*parameters);
+          const bool missing_content = std::any_of(
+              parameters->search_result.neighbors.begin() + range.start_index,
+              parameters->search_result.neighbors.begin() + range.end_index,
+              [](const indexes::Neighbor &neighbor) {
+                return !neighbor.attribute_contents.has_value();
+              });
+          if (missing_content) {
+            fanout_content_fetch_retry_count.Increment();
+            parameters->search_result.neighbors.clear();
+            retry = std::move(content_retry);
+          }
+        }
       }
-      CHECK(i == 0);
-      // Note: We do not sort neighbors here because we do not have the content
-      // of the local shard yet. In the SendReply function, we will sort the all
-      // neighbors based on the content if sorting is required.
-      // SearchResult construction automatically applies trimming based on LIMIT
-      // offset count IF the command allows it (ie - it does not require
-      // complete results).
-      parameters->search_result = SearchResult(
-          accumulated_total_count, std::move(neighbors), *parameters, true);
-      status = absl::OkStatus();
+      parameters->search_result.status = status;
+      completed_parameters = std::move(parameters);
     }
-    parameters->search_result.status = status;
+    if (retry) {
+      retry(std::move(completed_parameters));
+      return;
+    }
     // The destructor runs on whichever thread drops the last shared_ptr
     // reference. If remote shards complete first and the local shard (which
     // completes on the main thread via content resolution) drops the last
     // reference, we'll be on the main thread here.
     if (vmsdk::IsMainThread()) {
-      parameters->QueryCompleteMainThread(std::move(parameters));
+      completed_parameters->QueryCompleteMainThread(
+          std::move(completed_parameters));
     } else {
-      parameters->QueryCompleteBackground(std::move(parameters));
+      completed_parameters->QueryCompleteBackground(
+          std::move(completed_parameters));
     }
   }
 };
@@ -282,7 +334,19 @@ void PerformRemoteSearchRequest(
     std::unique_ptr<coordinator::SearchIndexPartitionRequest> request,
     const std::string &address,
     coordinator::ClientPool *coordinator_client_pool,
-    std::shared_ptr<SearchPartitionResultsTracker> tracker) {
+    std::shared_ptr<SearchPartitionResultsTracker> tracker,
+    cancel::Token cancellation_token) {
+  const uint64_t remaining_timeout_ms =
+      cancellation_token->RemainingTimeoutMs();
+  if (remaining_timeout_ms == 0) {
+    coordinator::SearchIndexPartitionResponse response;
+    tracker->HandleResponse(
+        response, address,
+        grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                     "Search request deadline exceeded before dispatch"));
+    return;
+  }
+  request->set_timeout_ms(remaining_timeout_ms);
   auto client = coordinator_client_pool->GetClient(address);
 
   client->SearchIndexPartition(
@@ -299,76 +363,112 @@ void PerformRemoteSearchRequestAsync(
     const std::string &address,
     coordinator::ClientPool *coordinator_client_pool,
     std::shared_ptr<SearchPartitionResultsTracker> tracker,
-    vmsdk::ThreadPool *thread_pool) {
+    vmsdk::ThreadPool *thread_pool, cancel::Token cancellation_token) {
   thread_pool->Schedule(
       [coordinator_client_pool, address = std::string(address),
-       request = std::move(request), tracker]() mutable {
+       request = std::move(request), tracker,
+       cancellation_token = std::move(cancellation_token)]() mutable {
         PerformRemoteSearchRequest(std::move(request), address,
-                                   coordinator_client_pool, tracker);
+                                   coordinator_client_pool, tracker,
+                                   std::move(cancellation_token));
       },
       vmsdk::ThreadPool::Priority::kHigh);
 }
 
-absl::Status PerformSearchFanoutAsync(
+namespace {
+
+absl::Status PerformSearchFanoutAsyncImpl(
     ValkeyModuleCtx *ctx,
     std::vector<vmsdk::cluster_map::NodeInfo> &search_targets,
     coordinator::ClientPool *coordinator_client_pool,
     std::unique_ptr<SearchParameters> parameters,
-    vmsdk::ThreadPool *thread_pool) {
+    vmsdk::ThreadPool *thread_pool, bool force_full_content,
+    std::optional<std::vector<std::optional<uint64_t>>> slot_fingerprints) {
   // Queue depth admission check is in commands.cc (before BlockedClient
   // creation) so that returning an error doesn't crash the blocked client.
   auto request = coordinator::ParametersToGRPCSearchRequest(*parameters);
-  uint64_t index_size = parameters->index_schema->GetDbKeyInfoSize();
-  uint32_t min_index_size =
-      options::GetFanoutUniformityMinIndexSize().GetValue();
+  uint64_t candidate_limit;
   if (parameters->IsNonVectorQuery()) {
-    // For non-vector queries, we optimize network traffic by reducing the
-    // per-shard fetch limit. Instead of fetching K from every shard, we
-    // calculate a limit based on the distribution profile to cover (offset +
-    // limit) results across the cluster.
-    uint64_t K = parameters->limit.first_index + parameters->limit.number;
-    // For queries requiring complete results (e.g., with SORTBY), we must
-    // fetch K results from each shard to guarantee global correctness.
-    // Also, for small indices (below the configured threshold), we skip the
-    // optimization.
-    if (index_size < min_index_size || parameters->RequiresCompleteResults()) {
-      request->mutable_limit()->set_first_index(0);
-      request->mutable_limit()->set_number(K);
-    } else {
-      size_t N = search_targets.size();
-      // The 'fanout-data-uniformity-percent' (U) represents the user's data
-      // distribution profile. 100 means data is perfectly balanced (Uniform); 0
-      // means data is heavily skewed.
-      uint32_t U = options::GetFanoutDataUniformity().GetValue();
-      // 1. Calculate the 'fair_share_limit' (The Base).
-      // This is the minimum results needed per shard if data is perfectly
-      // uniform. We use ceiling division (K + N - 1) / N to ensure the total
-      // sum across N shards is at least K.
-      uint64_t fair_share_limit = (K + N - 1) / N;
-      // 2. Calculate the 'skew_gap' (The Buffer).
-      // The extra results needed if data is skewed. The maximum gap is K -
-      // fair_share_limit.
-      uint64_t skew_gap = K - fair_share_limit;
-      // 3. Apply the 'Uniformity' (U) to the gap.
-      // - If U = 100 (Uniform): 0% gap added. Limit = fair_share_limit.
-      // - If U = 0 (Skewed): 100% gap added. Limit = K.
-      // Note: Currently, U is set to 0 by default and is a Dev config.
-      uint64_t optimized_limit =
-          fair_share_limit + ((100 - U) * skew_gap / 100);
-      request->mutable_limit()->set_first_index(0);
-      request->mutable_limit()->set_number(optimized_limit);
-    }
+    candidate_limit = parameters->limit.first_index + parameters->limit.number;
   } else {
-    // Vector searches: Use k as the limit to find top k results. In worst case,
-    // all top k results are from a single shard, so no need to fetch more than
-    // k.
-    request->mutable_limit()->set_first_index(0);
-    request->mutable_limit()->set_number(parameters->k);
+    candidate_limit = parameters->k;
   }
+  // Preserve correctness by always fetching K keys/scores. SORTBY is excluded
+  // because ranking requires the sort field for every candidate.
+  request->mutable_limit()->set_first_index(0);
+  request->mutable_limit()->set_number(candidate_limit);
+
+  auto mode = static_cast<options::FanoutContentFetchMode>(
+      options::GetFanoutContentFetchMode().GetValue());
+  bool optimize_content = !force_full_content && !parameters->no_content &&
+                          !parameters->RequiresCompleteResults() &&
+                          candidate_limit > 0 &&
+                          mode != options::FanoutContentFetchMode::kDisabled;
+  if (optimize_content) {
+    request->set_content_limit(
+        EstimateContentLimit(candidate_limit, search_targets.size(), mode));
+  } else if (force_full_content) {
+    // Fetch content for every candidate returned by the shard. The shard may
+    // retain a buffer beyond candidate_limit, and those candidates can become
+    // part of the final result if earlier content resolution fails.
+    request->clear_content_limit();
+  } else {
+    request->clear_content_limit();
+  }
+
+  if (!slot_fingerprints.has_value()) {
+    slot_fingerprints.emplace();
+    slot_fingerprints->reserve(search_targets.size());
+    for (const auto &node : search_targets) {
+      if (node.shard != nullptr) {
+        slot_fingerprints->emplace_back(node.shard->slots_fingerprint);
+      } else {
+        slot_fingerprints->emplace_back(std::nullopt);
+      }
+    }
+  }
+
+  std::function<void(std::unique_ptr<SearchParameters>)> content_retry;
+  if (optimize_content && request->content_limit() < candidate_limit) {
+    auto retry_targets = search_targets;
+    content_retry =
+        [retry_targets = std::move(retry_targets), coordinator_client_pool,
+         thread_pool, slot_fingerprints = *slot_fingerprints](
+            std::unique_ptr<SearchParameters> retry_parameters) mutable {
+          const uint64_t remaining_timeout_ms =
+              retry_parameters->cancellation_token->RemainingTimeoutMs();
+          if (remaining_timeout_ms == 0 ||
+              retry_parameters->cancellation_token->IsCancelled()) {
+            retry_parameters->search_result.status =
+                absl::DeadlineExceededError(kTimeoutMsg);
+            if (vmsdk::IsMainThread()) {
+              retry_parameters->QueryCompleteMainThread(
+                  std::move(retry_parameters));
+            } else {
+              retry_parameters->QueryCompleteBackground(
+                  std::move(retry_parameters));
+            }
+            return;
+          }
+          retry_parameters->timeout_ms = remaining_timeout_ms;
+          auto status = PerformSearchFanoutAsyncImpl(
+              nullptr, retry_targets, coordinator_client_pool,
+              std::move(retry_parameters), thread_pool,
+              /*force_full_content=*/true, std::move(slot_fingerprints));
+          if (!status.ok()) {
+            VMSDK_LOG(WARNING, nullptr)
+                << "Failed to retry FT.SEARCH with full content: " << status;
+          }
+        };
+  }
+  auto cancellation_token = parameters->cancellation_token;
   auto tracker = std::make_shared<SearchPartitionResultsTracker>(
-      search_targets.size(), parameters->k, std::move(parameters));
+      search_targets.size(), parameters->k, std::move(parameters),
+      std::move(content_retry));
   bool has_local_target = false;
-  for (auto &node : search_targets) {
+  for (size_t target_index = 0; target_index < search_targets.size();
+       ++target_index) {
+    auto &node = search_targets[target_index];
     if (node.is_local) {
       // Defer the local target enqueue, since it will own the parameters from
       // then on.
@@ -382,9 +482,8 @@ absl::Status PerformSearchFanoutAsync(
     if (ForceInvalidSlotFingerprint.GetValue()) {
       // test only: set an invalid slot fingerprint and force failure
       request_copy->set_slot_fingerprint(0);
-    } else if (node.shard != nullptr) {
-      // avoid accessing node.shard if it is not valid in unit tests
-      request_copy->set_slot_fingerprint(node.shard->slots_fingerprint);
+    } else if ((*slot_fingerprints)[target_index].has_value()) {
+      request_copy->set_slot_fingerprint(*(*slot_fingerprints)[target_index]);
     }
 
     // At 30 requests, it takes ~600 micros to enqueue all the requests.
@@ -398,10 +497,11 @@ absl::Status PerformSearchFanoutAsync(
         thread_pool->Size() > 1) {
       PerformRemoteSearchRequestAsync(std::move(request_copy), target_address,
                                       coordinator_client_pool, tracker,
-                                      thread_pool);
+                                      thread_pool, cancellation_token);
     } else {
       PerformRemoteSearchRequest(std::move(request_copy), target_address,
-                                 coordinator_client_pool, tracker);
+                                 coordinator_client_pool, tracker,
+                                 cancellation_token);
     }
   }
   if (has_local_target) {
@@ -414,6 +514,19 @@ absl::Status PerformSearchFanoutAsync(
         << "Failed to handle FT.SEARCH locally during fan-out";
   }
   return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::Status PerformSearchFanoutAsync(
+    ValkeyModuleCtx *ctx,
+    std::vector<vmsdk::cluster_map::NodeInfo> &search_targets,
+    coordinator::ClientPool *coordinator_client_pool,
+    std::unique_ptr<SearchParameters> parameters,
+    vmsdk::ThreadPool *thread_pool) {
+  return PerformSearchFanoutAsyncImpl(
+      ctx, search_targets, coordinator_client_pool, std::move(parameters),
+      thread_pool, /*force_full_content=*/false);
 }
 
 bool IsSystemUnderLowUtilization() {

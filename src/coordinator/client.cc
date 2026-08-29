@@ -7,6 +7,7 @@
 
 #include "src/coordinator/client.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -154,10 +155,13 @@ void ClientImpl::SearchIndexPartition(
   args->response =
       google::protobuf::Arena::Create<SearchIndexPartitionResponse>(
           &args->arena);
-  args->context.set_deadline(absl::ToChronoTime(
-      absl::Now() + absl::Seconds(query_connection_timeout->GetValue())));
   args->callback = std::move(done);
   args->request = std::move(request);
+  const auto rpc_timeout = std::min(
+      absl::Seconds(query_connection_timeout->GetValue()),
+      absl::Milliseconds(args->request->timeout_ms()));
+  args->context.set_deadline(
+      absl::ToChronoTime(absl::Now() + rpc_timeout));
   args->latency_sample = SAMPLE_EVERY_N(100);
   auto *args_raw = args.release();
   Metrics::GetStats().coordinator_bytes_out.fetch_add(
