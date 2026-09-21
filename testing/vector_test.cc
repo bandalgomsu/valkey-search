@@ -447,6 +447,53 @@ TEST_P(NormalizeStringAttributeTest, NormalizeStringAttribute) {
   }
 }
 
+TEST(NormalizeStringAttributeFp64Test, RejectsNonFiniteValues) {
+  auto index = VectorHNSW<double>::Create(
+      CreateHNSWVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                 kInitialCap, kM, kEFConstruction, kEFRuntime),
+      "attribute_identifier", data_model::ATTRIBUTE_DATA_TYPE_HASH, 0);
+  ASSERT_TRUE(index.ok());
+
+  for (const char *value : {"[NaN]", "[inf]", "[-inf]", "[1e999]"}) {
+    auto attribute = vmsdk::MakeUniqueValkeyString(value);
+    EXPECT_EQ(index.value()->NormalizeStringAttribute(std::move(attribute)),
+              nullptr)
+        << value;
+  }
+}
+
+// A FLOAT64 magnitude outside the float range is preserved in magnitude_fp64.
+TEST_F(VectorIndexTest, SaveTrackedKeysPreservesFp64Magnitude) {
+  auto index = VectorFlat<double>::Create(
+      CreateFlatVectorIndexProto(kDimensions,
+                                 data_model::DISTANCE_METRIC_COSINE,
+                                 kInitialCap, kBlockSize),
+      "attribute_identifier", data_model::ATTRIBUTE_DATA_TYPE_HASH, 0);
+  ASSERT_TRUE(index.ok());
+  ASSERT_TRUE(index.value()->GetNormalize());
+
+  constexpr double kMagnitude = 1e300;
+  std::vector<double> vector(kDimensions, 0.0);
+  vector[0] = kMagnitude;
+  absl::string_view vector_bytes(reinterpret_cast<const char *>(vector.data()),
+                                 vector.size() * sizeof(double));
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+      *index.value(), StringInternStore::Intern("fp64_key"), vector_bytes));
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK(index.value()->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  SupplementalContentChunkIter iter(&rdb);
+  ASSERT_TRUE(iter.HasNext());
+  auto chunk = iter.Next();
+  VMSDK_EXPECT_OK(chunk);
+  data_model::TrackedKeyMetadata metadata;
+  ASSERT_TRUE(metadata.ParseFromString((*chunk)->binary_content()));
+  EXPECT_FALSE(iter.HasNext());
+
+  ASSERT_TRUE(metadata.has_magnitude_fp64());
+  EXPECT_NEAR(metadata.magnitude_fp64() / kMagnitude, 1.0, 1e-12);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     NormalizeStringAttributeTests, NormalizeStringAttributeTest,
 

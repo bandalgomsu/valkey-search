@@ -10,6 +10,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <queue>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -52,24 +54,80 @@ namespace valkey_search {
 
 namespace indexes {
 
-template <typename T>
-float CalcReciprocalMagnitude(const T *src, size_t size) {
-  // Accumulate in float even when T is 2 bytes: squaring a half-precision
-  // value overflows its own exponent range well before it overflows float.
-  float sum_sq = 0.0f;
-  for (size_t i = 0; i < size; i++) {
-    float v = static_cast<float>(src[i]);
-    sum_sq += v * v;
+namespace {
+
+// Holds the scale selected for a FLOAT64 vector. Subnormal values need a
+// bit-based ratio because -ffast-math may flush them to zero in arithmetic.
+class Float64Scale {
+ public:
+  static Float64Scale From(const double *src, size_t size) {
+    uint64_t max_abs_bits = 0;
+    for (size_t i = 0; i < size; ++i) {
+      max_abs_bits = std::max(max_abs_bits,
+                              std::bit_cast<uint64_t>(src[i]) & kMagnitudeMask);
+    }
+    return Float64Scale(max_abs_bits);
   }
-  return (sum_sq == 0.0f) ? 1.0f : (1.0f / std::sqrt(sum_sq));
+
+  bool IsZero() const { return max_abs_bits_ == 0; }
+
+  double Reciprocal() const {
+    return 1.0 / std::bit_cast<double>(max_abs_bits_);
+  }
+
+  double Scale(double value) const {
+    if (!IsSubnormal()) {
+      return value / std::bit_cast<double>(max_abs_bits_);
+    }
+    const uint64_t bits = std::bit_cast<uint64_t>(value);
+    const double scaled = static_cast<double>(bits & kMagnitudeMask) /
+                          static_cast<double>(max_abs_bits_);
+    return (bits >> 63) == 0 ? scaled : -scaled;
+  }
+
+ private:
+  static constexpr uint64_t kExponentMask = 0x7ff0000000000000ULL;
+  static constexpr uint64_t kMagnitudeMask = 0x7fffffffffffffffULL;
+
+  explicit Float64Scale(uint64_t max_abs_bits) : max_abs_bits_(max_abs_bits) {}
+
+  bool IsSubnormal() const { return (max_abs_bits_ & kExponentMask) == 0; }
+
+  uint64_t max_abs_bits_;
+};
+
+}  // namespace
+
+template <typename T>
+double CalcReciprocalMagnitude(const T *src, size_t size) {
+  if constexpr (!std::is_same_v<T, double>) {
+    float sum_sq = 0.0f;
+    for (size_t i = 0; i < size; i++) {
+      const float value = static_cast<float>(src[i]);
+      sum_sq += value * value;
+    }
+    return (sum_sq == 0.0f) ? 1.0f : (1.0f / std::sqrt(sum_sq));
+  } else {
+    // Scale before squaring so ordinary FLOAT64 values such as 1e200 do not
+    // overflow, and values such as 1e-300 do not underflow to zero.
+    const Float64Scale scale = Float64Scale::From(src, size);
+    if (scale.IsZero()) return 1.0;
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < size; i++) {
+      const double scaled = scale.Scale(src[i]);
+      sum_sq += scaled * scaled;
+    }
+    return scale.Reciprocal() / std::sqrt(sum_sq);
+  }
 }
 
-template float CalcReciprocalMagnitude<float>(const float *, size_t);
-template float CalcReciprocalMagnitude<float16>(const float16 *, size_t);
-template float CalcReciprocalMagnitude<bfloat16>(const bfloat16 *, size_t);
+template double CalcReciprocalMagnitude<float>(const float *, size_t);
+template double CalcReciprocalMagnitude<float16>(const float16 *, size_t);
+template double CalcReciprocalMagnitude<bfloat16>(const bfloat16 *, size_t);
+template double CalcReciprocalMagnitude<double>(const double *, size_t);
 
-float CalcReciprocalMagnitude(absl::string_view record,
-                              data_model::VectorDataType data_type) {
+double CalcReciprocalMagnitude(absl::string_view record,
+                               data_model::VectorDataType data_type) {
   switch (data_type) {
     case data_model::VECTOR_DATA_TYPE_FLOAT32:
       return CalcReciprocalMagnitude(
@@ -83,52 +141,136 @@ float CalcReciprocalMagnitude(absl::string_view record,
       return CalcReciprocalMagnitude(
           reinterpret_cast<const bfloat16 *>(record.data()),
           record.size() / sizeof(bfloat16));
+    case data_model::VECTOR_DATA_TYPE_FLOAT64:
+      return CalcReciprocalMagnitude(
+          reinterpret_cast<const double *>(record.data()),
+          record.size() / sizeof(double));
     default:
       CHECK(false) << "unsupported vector data type";
   }
 }
 
 template <typename T>
-std::vector<char> NormalizeVector(absl::string_view record,
-                                  float reciprocal_magnitude) {
-  if (ABSL_PREDICT_FALSE(reciprocal_magnitude == 0.0f)) {
-    reciprocal_magnitude = 1.0f;
+std::vector<char> NormalizeStandardVector(absl::string_view record,
+                                          double reciprocal_magnitude) {
+  if (ABSL_PREDICT_FALSE(reciprocal_magnitude == 0.0)) {
+    reciprocal_magnitude = 1.0;
   }
   size_t dimensions = record.size() / sizeof(T);
   const T *src = reinterpret_cast<const T *>(record.data());
   std::vector<char> ret(record.size());
   T *dst = reinterpret_cast<T *>(ret.data());
   for (size_t i = 0; i < dimensions; i++) {
-    // Scale in float, then round once back into T. Scaling in T would
-    // double-round for the 2-byte types.
-    dst[i] = static_cast<T>(reciprocal_magnitude * static_cast<float>(src[i]));
+    // Preserve the established FLOAT32/FLOAT16/BFLOAT16 hot path.
+    dst[i] = static_cast<T>(static_cast<float>(reciprocal_magnitude) *
+                            static_cast<float>(src[i]));
+  }
+  return ret;
+}
+
+std::vector<char> NormalizeFloat64Elements(absl::string_view record,
+                                           double reciprocal_magnitude) {
+  const size_t dimensions = record.size() / sizeof(double);
+  const double *src = reinterpret_cast<const double *>(record.data());
+  std::vector<char> ret(record.size());
+  double *dst = reinterpret_cast<double *>(ret.data());
+  for (size_t i = 0; i < dimensions; ++i) {
+    dst[i] = reciprocal_magnitude * src[i];
+  }
+  return ret;
+}
+
+bool IsFiniteNonZeroDouble(double value) {
+  constexpr uint64_t kExponentMask = 0x7ff0000000000000ULL;
+  constexpr uint64_t kMagnitudeMask = 0x7fffffffffffffffULL;
+  const uint64_t bits = std::bit_cast<uint64_t>(value);
+  return (bits & kExponentMask) != kExponentMask &&
+         (bits & kMagnitudeMask) != 0;
+}
+
+// FLOAT64's reciprocal magnitude can be outside the representable double
+// range even when every element is finite: 1 / DBL_TRUE_MIN is infinity.
+// Keep the normal fast path for representable reciprocals. Only when its
+// reciprocal overflows or underflows do we retain the scale while normalizing.
+std::vector<char> NormalizeFloat64Vector(absl::string_view record,
+                                         double reciprocal_magnitude) {
+  if (IsFiniteNonZeroDouble(reciprocal_magnitude)) {
+    return NormalizeFloat64Elements(record, reciprocal_magnitude);
+  }
+
+  // Each division is bounded in [-1, 1], so this path does not materialize
+  // an overflowing reciprocal magnitude.
+  const size_t dimensions = record.size() / sizeof(double);
+  const double *src = reinterpret_cast<const double *>(record.data());
+  const Float64Scale scale = Float64Scale::From(src, dimensions);
+
+  std::vector<char> ret(record.size());
+  double *dst = reinterpret_cast<double *>(ret.data());
+  if (scale.IsZero()) {
+    std::memcpy(dst, src, record.size());
+    return ret;
+  }
+
+  double scaled_sum_sq = 0.0;
+  for (size_t i = 0; i < dimensions; ++i) {
+    const double scaled = scale.Scale(src[i]);
+    scaled_sum_sq += scaled * scaled;
+  }
+  const double reciprocal_scaled_magnitude = 1.0 / std::sqrt(scaled_sum_sq);
+  for (size_t i = 0; i < dimensions; ++i) {
+    dst[i] = scale.Scale(src[i]) * reciprocal_scaled_magnitude;
   }
   return ret;
 }
 
 template <typename T>
-std::vector<char> NormalizeVector(absl::string_view record, float *magnitude) {
-  float reciprocal_magnitude = CalcReciprocalMagnitude(
+struct VectorNormalizer {
+  static std::vector<char> Normalize(absl::string_view record,
+                                     double reciprocal_magnitude) {
+    return NormalizeStandardVector<T>(record, reciprocal_magnitude);
+  }
+};
+
+template <>
+struct VectorNormalizer<double> {
+  static std::vector<char> Normalize(absl::string_view record,
+                                     double reciprocal_magnitude) {
+    return NormalizeFloat64Vector(record, reciprocal_magnitude);
+  }
+};
+
+template <typename T>
+std::vector<char> NormalizeVector(absl::string_view record,
+                                  double reciprocal_magnitude) {
+  return VectorNormalizer<T>::Normalize(record, reciprocal_magnitude);
+}
+
+template <typename T>
+std::vector<char> NormalizeVector(absl::string_view record, double *magnitude) {
+  double reciprocal_magnitude = CalcReciprocalMagnitude(
       reinterpret_cast<const T *>(record.data()), record.size() / sizeof(T));
   std::vector<char> ret = NormalizeVector<T>(record, reciprocal_magnitude);
 
   if (magnitude) {
-    *magnitude = 1.0f / reciprocal_magnitude;
+    *magnitude = 1.0 / reciprocal_magnitude;
   }
   return ret;
 }
 
-template std::vector<char> NormalizeVector<float>(absl::string_view, float);
-template std::vector<char> NormalizeVector<float16>(absl::string_view, float);
-template std::vector<char> NormalizeVector<bfloat16>(absl::string_view, float);
-template std::vector<char> NormalizeVector<float>(absl::string_view, float *);
-template std::vector<char> NormalizeVector<float16>(absl::string_view, float *);
+template std::vector<char> NormalizeVector<float>(absl::string_view, double);
+template std::vector<char> NormalizeVector<float16>(absl::string_view, double);
+template std::vector<char> NormalizeVector<bfloat16>(absl::string_view, double);
+template std::vector<char> NormalizeVector<double>(absl::string_view, double);
+template std::vector<char> NormalizeVector<float>(absl::string_view, double *);
+template std::vector<char> NormalizeVector<float16>(absl::string_view,
+                                                    double *);
 template std::vector<char> NormalizeVector<bfloat16>(absl::string_view,
-                                                     float *);
+                                                     double *);
+template std::vector<char> NormalizeVector<double>(absl::string_view, double *);
 
 std::vector<char> NormalizeVector(absl::string_view record,
                                   data_model::VectorDataType data_type,
-                                  float reciprocal_magnitude) {
+                                  double reciprocal_magnitude) {
   switch (data_type) {
     case data_model::VECTOR_DATA_TYPE_FLOAT32:
       return NormalizeVector<float>(record, reciprocal_magnitude);
@@ -136,6 +278,8 @@ std::vector<char> NormalizeVector(absl::string_view record,
       return NormalizeVector<float16>(record, reciprocal_magnitude);
     case data_model::VECTOR_DATA_TYPE_BFLOAT16:
       return NormalizeVector<bfloat16>(record, reciprocal_magnitude);
+    case data_model::VECTOR_DATA_TYPE_FLOAT64:
+      return NormalizeVector<double>(record, reciprocal_magnitude);
     default:
       CHECK(false) << "unsupported vector data type";
   }
@@ -185,7 +329,7 @@ absl::StatusOr<RecordResult> VectorBase::AddRecord(const InternedStringPtr &key,
     return RecordResult::kInvalidData;
   }
   auto vector_record = data.ConsumeVector();
-  float magnitude = 1.0f / vector_record->GetReciprocalMagnitude();
+  double magnitude = 1.0 / vector_record->GetReciprocalMagnitude();
   VMSDK_ASSIGN_OR_RETURN(auto internal_id, TrackKey(key, magnitude));
   absl::Status add_result =
       AddRecordImpl(internal_id, std::move(vector_record));
@@ -233,7 +377,7 @@ absl::StatusOr<RecordResult> VectorBase::ModifyRecord(
     return RecordResult::kInvalidData;
   }
   auto vector_record = data.ConsumeVector();
-  float magnitude = 1.0f / vector_record->GetReciprocalMagnitude();
+  double magnitude = 1.0 / vector_record->GetReciprocalMagnitude();
   VMSDK_ASSIGN_OR_RETURN(auto internal_id, GetInternalId(key));
   VMSDK_ASSIGN_OR_RETURN(
       bool res, IsVectorUnchanged(key, magnitude, vector_record.get()));
@@ -337,7 +481,7 @@ absl::StatusOr<std::optional<uint64_t>> VectorBase::UnTrackKey(
 }
 
 absl::StatusOr<uint64_t> VectorBase::TrackKey(const InternedStringPtr &key,
-                                              float magnitude) {
+                                              double magnitude) {
   absl::WriterMutexLock lock(&key_to_metadata_mutex_);
   auto id = inc_id_++;
   auto [_, succ] = tracked_metadata_by_key_.insert(
@@ -352,7 +496,7 @@ absl::StatusOr<uint64_t> VectorBase::TrackKey(const InternedStringPtr &key,
 }
 
 absl::StatusOr<bool> VectorBase::IsVectorUnchanged(
-    const InternedStringPtr &key, float magnitude,
+    const InternedStringPtr &key, double magnitude,
     const VectorRecord *vector_record) {
   absl::ReaderMutexLock lock(&resize_mutex_);
   const VectorRecord *stored_record;
@@ -417,7 +561,8 @@ absl::Status VectorBase::SaveTrackedKeys(
     data_model::TrackedKeyMetadata metadata_pb;
     metadata_pb.set_key(key->Str());
     metadata_pb.set_internal_id(metadata.internal_id);
-    metadata_pb.set_magnitude(metadata.magnitude);
+    metadata_pb.set_magnitude(static_cast<float>(metadata.magnitude));
+    metadata_pb.set_magnitude_fp64(metadata.magnitude);
     auto metadata_pb_str = metadata_pb.SerializeAsString();
     VMSDK_RETURN_IF_ERROR(
         chunked_out.SaveChunk(metadata_pb_str.data(), metadata_pb_str.size()))
@@ -442,7 +587,9 @@ absl::Status VectorBase::LoadTrackedKeys(
     tracked_metadata_by_key_.insert(
         {interned_key,
          {.internal_id = tracked_key_metadata.internal_id(),
-          .magnitude = tracked_key_metadata.magnitude()}});
+          .magnitude = tracked_key_metadata.has_magnitude_fp64()
+                           ? tracked_key_metadata.magnitude_fp64()
+                           : tracked_key_metadata.magnitude()}});
     key_by_internal_id_.insert(
         {tracked_key_metadata.internal_id(), interned_key});
 
@@ -486,10 +633,10 @@ uint32_t VectorBase::GetMutationWeight() const {
   return options::GetMutationWeightVector().GetValue();
 }
 
-absl::StatusOr<std::pair<float, hnswlib::labeltype>>
+absl::StatusOr<std::pair<double, hnswlib::labeltype>>
 VectorBase::ComputeDistanceFromRecord(const InternedStringPtr &key,
                                       absl::string_view query,
-                                      float query_magnitude) const {
+                                      double query_magnitude) const {
   VMSDK_ASSIGN_OR_RETURN(auto internal_id, GetInternalIdDuringSearch(key));
   const auto &vector_record = GetVectorLockFree(internal_id);
   if (!vector_record) {
@@ -499,7 +646,7 @@ VectorBase::ComputeDistanceFromRecord(const InternedStringPtr &key,
   if (normalize_) {
     query_magnitude *= vector_record->GetReciprocalMagnitude();
   }
-  return (std::pair<float, hnswlib::labeltype>){
+  return (std::pair<double, hnswlib::labeltype>){
       ComputeDistance(query, vector_record.get(), query_magnitude),
       internal_id};
 }
@@ -528,9 +675,9 @@ absl::StatusOr<float> VectorBase::RecomputeDistance(
 }
 
 bool VectorBase::AddPrefilteredKey(
-    absl::string_view query, float query_magnitude,
+    absl::string_view query, double query_magnitude,
     const InternedStringPtr &key, uint64_t count,
-    std::priority_queue<std::pair<float, hnswlib::labeltype>> &results,
+    std::priority_queue<std::pair<double, hnswlib::labeltype>> &results,
     absl::flat_hash_set<const char *> &top_keys) const {
   auto result = ComputeDistanceFromRecord(key, query, query_magnitude);
   if (!result.ok()) {
@@ -584,6 +731,8 @@ absl::Status VectorBase::ForEachUnTrackedKey(
 
 template absl::StatusOr<std::vector<Neighbor>> VectorBase::CreateReply<float>(
     std::priority_queue<std::pair<float, hnswlib::labeltype>> &knn_res);
+template absl::StatusOr<std::vector<Neighbor>> VectorBase::CreateReply<double>(
+    std::priority_queue<std::pair<double, hnswlib::labeltype>> &knn_res);
 
 absl::Status CheckSimsimdBf16Capability() {
 #if defined(__SSE2__) || defined(__AVX512F__) || \
@@ -612,7 +761,7 @@ absl::Status CheckSimsimdBf16Capability() {
 }
 
 std::shared_ptr<VectorRecord> VectorRecord::Construct(
-    absl::string_view vector, float reciprocal_magnitude,
+    absl::string_view vector, double reciprocal_magnitude,
     Allocator *allocator) {
   size_t total_size = sizeof(VectorRecord) + vector.size();
   void *mem =
@@ -628,9 +777,10 @@ std::shared_ptr<VectorRecord> VectorRecord::Construct(
           }};
 }
 
-VectorRecord::VectorRecord(absl::string_view vector, float reciprocal_magnitude)
+VectorRecord::VectorRecord(absl::string_view vector,
+                           double reciprocal_magnitude)
     : reciprocal_magnitude_(
-          reciprocal_magnitude == 0.0f ? 1.0f : reciprocal_magnitude) {
+          reciprocal_magnitude == 0.0 ? 1.0 : reciprocal_magnitude) {
   std::memcpy(data_, vector.data(), vector.size());
 }
 }  // namespace indexes

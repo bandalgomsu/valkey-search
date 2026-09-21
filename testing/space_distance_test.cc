@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -44,9 +45,11 @@
 #include "third_party/hnswlib/space_ip.h"
 #include "third_party/hnswlib/space_ip_bfloat16.h"
 #include "third_party/hnswlib/space_ip_fp16.h"
+#include "third_party/hnswlib/space_ip_fp64.h"
 #include "third_party/hnswlib/space_l2.h"
 #include "third_party/hnswlib/space_l2_bfloat16.h"
 #include "third_party/hnswlib/space_l2_fp16.h"
+#include "third_party/hnswlib/space_l2_fp64.h"
 
 namespace valkey_search {
 namespace {
@@ -89,6 +92,18 @@ std::vector<float16> PadFp16(std::initializer_list<float> prefix, size_t dim) {
   return v;
 }
 
+std::vector<double> PadFp64(std::initializer_list<double> prefix, size_t dim) {
+  std::vector<double> v(dim, 0.0);
+  size_t i = 0;
+  for (double x : prefix) {
+    if (i >= dim) {
+      break;
+    }
+    v[i++] = x;
+  }
+  return v;
+}
+
 std::vector<bfloat16> PadBf16(std::initializer_list<float> prefix, size_t dim) {
   std::vector<bfloat16> v(dim, bfloat16{0.0f});
   size_t i = 0;
@@ -105,8 +120,9 @@ std::vector<bfloat16> PadBf16(std::initializer_list<float> prefix, size_t dim) {
 // magnitudes. L2 kernels ignore it; IP kernels multiply the dot product by it
 // before subtracting from 1. These tests pass un-normalized vectors, so 1.0f
 // is the identity and the expectations below are the raw distances.
-float CallDist(hnswlib::SpaceInterface<float>& space, const void* a,
-               const void* b, float magnitude = 1.0f) {
+template <typename DistanceT>
+DistanceT CallDist(hnswlib::SpaceInterface<DistanceT>& space, const void* a,
+                   const void* b, DistanceT magnitude = DistanceT{1}) {
   return space.get_dist_func()(a, b, space.get_dist_func_param(), magnitude);
 }
 
@@ -245,6 +261,57 @@ TEST(SpaceDistanceIpFp16, OrthogonalBases) {
     EXPECT_NEAR(CallDist(space, e0.data(), e1.data()), 1.0f, kFp16Tolerance)
         << "dim=" << dim;
   }
+}
+
+// ---------------------------------------------------------------------------
+// FP64 spaces retain double distances while reading stored double elements.
+// ---------------------------------------------------------------------------
+
+TEST(SpaceDistanceL2Fp64, HandComputed) {
+  for (size_t dim : AllDims()) {
+    hnswlib::L2SpaceFP64 space(dim);
+    auto v1 = PadFp64({3.0, 4.0}, dim);
+    auto v2 = PadFp64({}, dim);
+    EXPECT_DOUBLE_EQ(CallDist(space, v1.data(), v2.data()), 25.0)
+        << "dim=" << dim;
+  }
+}
+
+TEST(SpaceDistanceL2Fp64, SelfDistanceZero) {
+  for (size_t dim : AllDims()) {
+    hnswlib::L2SpaceFP64 space(dim);
+    auto v = PadFp64({1.0, 2.0, 3.0, 4.0, 5.0}, dim);
+    EXPECT_DOUBLE_EQ(CallDist(space, v.data(), v.data()), 0.0) << "dim=" << dim;
+  }
+}
+
+TEST(SpaceDistanceIpFp64, HandComputed) {
+  for (size_t dim : AllDims()) {
+    hnswlib::InnerProductSpaceFP64 space(dim);
+    auto v1 = PadFp64({1.0, 2.0, 3.0}, dim);
+    auto v2 = PadFp64({4.0, 5.0, 6.0}, dim);
+    EXPECT_DOUBLE_EQ(CallDist(space, v1.data(), v2.data()), -31.0)
+        << "dim=" << dim;
+  }
+}
+
+TEST(SpaceDistanceIpFp64, CosineExtremeFiniteVectorsRemainFinite) {
+  hnswlib::InnerProductSpaceFP64 space(1);
+  for (const double component : {1e200, 1e-300}) {
+    const auto v = PadFp64({component}, 1);
+    // The reciprocal product either underflows to zero or overflows. The FP64
+    // cosine kernel must still compute the normalized dot product.
+    EXPECT_DOUBLE_EQ(CallDist(space, v.data(), v.data(), 0.0), 0.0)
+        << component;
+  }
+}
+
+TEST(SpaceDistanceL2Fp64, LargeFiniteVectorsSaturateWithoutInfinity) {
+  hnswlib::L2SpaceFP64 space(1);
+  const auto positive = PadFp64({1e200}, 1);
+  const auto negative = PadFp64({-1e200}, 1);
+  EXPECT_DOUBLE_EQ(CallDist(space, positive.data(), negative.data()),
+                   std::numeric_limits<double>::max());
 }
 
 // ---------------------------------------------------------------------------
