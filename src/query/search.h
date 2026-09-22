@@ -281,6 +281,11 @@ struct SearchParameters {
     return no_content && !RequiresCompleteResults();
   }
 
+  // True when this command can serialize its complete client response from a
+  // background thread. The default keeps commands on the existing unblock /
+  // main-thread reply path.
+  virtual bool CanGenerateReplyInBackground() const { return false; }
+
   virtual absl::Status PreParseQueryString();
   virtual absl::Status PostParseQueryString();
   // Virtual so specialized parameter types (e.g. FT.HYBRID's fused-result

@@ -8,6 +8,7 @@
 #ifndef VALKEYSEARCH_SRC_COMMANDS_COMMANDS_H_
 #define VALKEYSEARCH_SRC_COMMANDS_COMMANDS_H_
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -161,6 +162,8 @@ struct QueryCommand : public query::SearchParameters {
   //
   virtual void SendReply(ValkeyModuleCtx *ctx,
                          query::SearchResult &search_result) = 0;
+  // Generate the reply, including asynchronous failure and timeout handling.
+  int GenerateReply(ValkeyModuleCtx *ctx);
   //
   // Determine if we need full results or if we can optimize with trimming
   //
@@ -172,6 +175,10 @@ struct QueryCommand : public query::SearchParameters {
   void QueryCompleteMainThread(std::unique_ptr<SearchParameters> self) override;
 
   std::optional<vmsdk::BlockedClient> blocked_client;
+  // A reply was accumulated with a thread-safe context before the blocked
+  // client was unblocked. The reply callback must then only complete the
+  // unblock, not serialize a second response.
+  std::atomic<bool> reply_generated_in_background{false};
 
  private:
   void QueryCompleteImpl(std::unique_ptr<SearchParameters> parameters);
