@@ -34,7 +34,7 @@ class ExprTest : public vmsdk::ValkeyTest {
       if (itr != attrs.attrs.end()) {
         return itr->second;
       } else {
-        return Value{};
+        return Value::Missing();
       }
     }
   };
@@ -202,8 +202,8 @@ TEST_F(ExprTest, NotOperatorRequiresOperand) {
 }
 
 TEST_F(ExprTest, CaseRequiresExactlyThreeArguments) {
-  for (absl::string_view expr : {"case()", "case(1)", "case(1, 2)",
-                                 "case(1, 2, 3, 4)"}) {
+  for (absl::string_view expr :
+       {"case()", "case(1)", "case(1, 2)", "case(1, 2, 3, 4)"}) {
     auto compiled = Expression::Compile(cc, expr);
     EXPECT_FALSE(compiled.ok())
         << "Expression unexpectedly compiled: '" << expr << "'";

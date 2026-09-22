@@ -167,12 +167,20 @@ The exists function returns 0 if the input argument is Nil else 1. This can be u
 ## Conditional Function
 
 The `case` function selects one of two expressions based on a condition, like
-the C/C++ conditional (`?:`) operator. A non-zero condition selects `if_true`;
-otherwise it selects `if_false`. Only the selected expression is evaluated.
+the C/C++ conditional (`?:`) operator. Only the selected expression is
+evaluated.
+
+The condition uses the expression language's truthiness rules: numeric zero is
+false and every other numeric value is true; an array is true when non-empty;
+and Nil is false. In compatibility behavior 1.2.1 and later, a non-empty
+string is true and an empty string is false; earlier compatibility behavior
+considers all strings false. A missing field condition propagates as missing
+when missing-value propagation compatibility behavior is enabled; otherwise it
+is false and selects `if_false`.
 
 |              Syntax              | Operation |
 | :------------------------------: | :-------- |
-| case(condition, if_true, if_false) | Return `if_true` when `condition` is non-zero, otherwise return `if_false`. |
+| case(condition, if_true, if_false) | Return `if_true` when `condition` is true, otherwise return `if_false`. |
 
 For example, the following gives records without `foo` the value `no foo`
 without evaluating the missing field reference:
