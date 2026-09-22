@@ -163,3 +163,20 @@ The exists function returns 0 if the input argument is Nil else 1. This can be u
 |    Syntax     | Operation                      |
 | :-----------: | :----------------------------- |
 | exists(value) | 0 if the value is Nil, else 1. |
+
+## Conditional Function
+
+The `case` function selects one of two expressions based on a condition, like
+the C/C++ conditional (`?:`) operator. A non-zero condition selects `if_true`;
+otherwise it selects `if_false`. Only the selected expression is evaluated.
+
+|              Syntax              | Operation |
+| :------------------------------: | :-------- |
+| case(condition, if_true, if_false) | Return `if_true` when `condition` is non-zero, otherwise return `if_false`. |
+
+For example, the following gives records without `foo` the value `no foo`
+without evaluating the missing field reference:
+
+```
+case(exists(@foo), @foo, "no foo")
+```
