@@ -77,9 +77,14 @@ Tag::Tag(const data_model::TagIndex &tag_index_proto)
     : IndexBase(IndexerType::kTag),
       separator_(tag_index_proto.separator()[0]),
       case_sensitive_(tag_index_proto.case_sensitive()),
-      tree_(raxNew()) {}
+      use_hash_map_(tag_index_proto.use_hash_map()),
+      tree_(use_hash_map_ ? nullptr : raxNew()) {}
 
-Tag::~Tag() { raxFreeWithCallback(tree_, &TagFreeCallback); }
+Tag::~Tag() {
+  if (tree_) {
+    raxFreeWithCallback(tree_, &TagFreeCallback);
+  }
+}
 
 std::string Tag::Normalize(absl::string_view tag) const {
   if (case_sensitive_) {
@@ -94,6 +99,10 @@ std::string Tag::Normalize(absl::string_view tag) const {
 
 void Tag::IndexTagForKey(absl::string_view tag, const InternedStringPtr &key) {
   std::string norm = Normalize(tag);
+  if (use_hash_map_) {
+    hash_map_[std::move(norm)].insert(key);
+    return;
+  }
   MutateCtx ctx{&key, /*insert=*/true};
   raxMutate(tree_, reinterpret_cast<unsigned char *>(norm.data()), norm.size(),
             &TagMutateTrampoline, &ctx, ADD);
@@ -102,6 +111,16 @@ void Tag::IndexTagForKey(absl::string_view tag, const InternedStringPtr &key) {
 void Tag::DeindexTagForKey(absl::string_view tag,
                            const InternedStringPtr &key) {
   std::string norm = Normalize(tag);
+  if (use_hash_map_) {
+    auto it = hash_map_.find(norm);
+    if (it != hash_map_.end()) {
+      it->second.erase(key);
+      if (it->second.empty()) {
+        hash_map_.erase(it);
+      }
+    }
+    return;
+  }
   MutateCtx ctx{&key, /*insert=*/false};
   raxMutate(tree_, reinterpret_cast<unsigned char *>(norm.data()), norm.size(),
             &TagMutateTrampoline, &ctx, SUBTRACT);
@@ -284,7 +303,7 @@ absl::StatusOr<bool> Tag::RemoveRecord(const InternedStringPtr &key,
 }
 
 int Tag::RespondWithInfo(ValkeyModuleCtx *ctx) const {
-  auto num_replies = 8;
+  auto num_replies = 10;
   ValkeyModule_ReplyWithSimpleString(ctx, "type");
   ValkeyModule_ReplyWithSimpleString(ctx, "TAG");
   ValkeyModule_ReplyWithSimpleString(ctx, "SEPARATOR");
@@ -292,6 +311,8 @@ int Tag::RespondWithInfo(ValkeyModuleCtx *ctx) const {
       ctx, std::string(&separator_, sizeof(char)).c_str());
   ValkeyModule_ReplyWithSimpleString(ctx, "CASESENSITIVE");
   ValkeyModule_ReplyWithSimpleString(ctx, case_sensitive_ ? "1" : "0");
+  ValkeyModule_ReplyWithSimpleString(ctx, "HASHMAP");
+  ValkeyModule_ReplyWithSimpleString(ctx, use_hash_map_ ? "1" : "0");
   ValkeyModule_ReplyWithSimpleString(ctx, "size");
   absl::MutexLock lock(&index_mutex_);
   ValkeyModule_ReplyWithCString(
@@ -304,6 +325,7 @@ std::unique_ptr<data_model::Index> Tag::ToProto() const {
   auto tag_index = std::make_unique<data_model::TagIndex>();
   tag_index->set_separator(absl::string_view(&separator_, 1));
   tag_index->set_case_sensitive(case_sensitive_);
+  tag_index->set_use_hash_map(use_hash_map_);
   index_proto->set_allocated_tag_index(tag_index.release());
   return index_proto;
 }
@@ -339,6 +361,10 @@ bool Tag::ContainsKey(absl::string_view value,
   // Lock-free by the same read-side invariant GetValue relies on: the index is
   // not mutated while the time-sliced mutex is held in read mode.
   std::string norm = Normalize(value);
+  if (use_hash_map_) {
+    auto it = hash_map_.find(norm);
+    return it != hash_map_.end() && it->second.contains(key);
+  }
   void *slot = nullptr;
   if (raxFind(tree_, reinterpret_cast<unsigned char *>(norm.data()),
               norm.size(), &slot) != 1) {
@@ -356,31 +382,29 @@ bool Tag::ContainsKey(absl::string_view value,
 // -- Search / EntriesFetcher / EntriesFetcherIterator --------------------
 
 Tag::EntriesFetcherIterator::EntriesFetcherIterator(
-    const std::vector<void *> &slots,
+    const std::vector<PostingListRef> &postings,
     const std::vector<InternedStringPtr> &extras)
-    : slots_(slots), extras_(extras) {
+    : postings_(postings), extras_(extras) {
   AdvanceToNextNonEmpty();
 }
 
 Tag::EntriesFetcherIterator::~EntriesFetcherIterator() {
-  // The bag's storage lives in the rax slot — Release so our local copy's
-  // destructor doesn't free it.
-  (void)bag_.Release();
+  ReleaseCurrentPosting();
 }
 
 bool Tag::EntriesFetcherIterator::Done() const {
-  return slots_done_ && extras_idx_ >= extras_.size();
+  return postings_done_ && extras_idx_ >= extras_.size();
 }
 
 void Tag::EntriesFetcherIterator::Next() {
-  if (!slots_done_) {
-    ++bag_it_;
-    if (bag_it_ != bag_end_) {
-      current_ = *bag_it_;
+  if (!postings_done_) {
+    ++posting_it_;
+    if (posting_it_ != posting_end_) {
+      current_ = *posting_it_;
       return;
     }
-    (void)bag_.Release();
-    ++slot_idx_;
+    ReleaseCurrentPosting();
+    ++posting_idx_;
     AdvanceToNextNonEmpty();
     return;
   }
@@ -395,51 +419,84 @@ const InternedStringPtr &Tag::EntriesFetcherIterator::operator*() const {
 }
 
 void Tag::EntriesFetcherIterator::AdvanceToNextNonEmpty() {
-  while (slot_idx_ < slots_.size()) {
-    bag_ = BagOfInternedStringPtrs::Adopt(
-        reinterpret_cast<uintptr_t>(slots_[slot_idx_]));
-    bag_it_ = bag_.begin();
-    bag_end_ = bag_.end();
-    if (bag_it_ != bag_end_) {
-      current_ = *bag_it_;
+  while (posting_idx_ < postings_.size()) {
+    const auto &posting = postings_[posting_idx_];
+    if (posting.hash_map_bag) {
+      hash_map_bag_ = posting.hash_map_bag;
+      posting_it_ = hash_map_bag_->begin();
+      posting_end_ = hash_map_bag_->end();
+    } else {
+      rax_bag_ = BagOfInternedStringPtrs::Adopt(posting.rax_storage);
+      owns_rax_bag_ = true;
+      posting_it_ = rax_bag_.begin();
+      posting_end_ = rax_bag_.end();
+    }
+    if (posting_it_ != posting_end_) {
+      current_ = *posting_it_;
       return;
     }
-    (void)bag_.Release();
-    ++slot_idx_;
+    ReleaseCurrentPosting();
+    ++posting_idx_;
   }
-  slots_done_ = true;
+  postings_done_ = true;
   if (extras_idx_ < extras_.size()) {
     current_ = extras_[extras_idx_];
   }
 }
 
+void Tag::EntriesFetcherIterator::ReleaseCurrentPosting() {
+  if (owns_rax_bag_) {
+    // The rax slot owns this storage; return it before advancing.
+    (void)rax_bag_.Release();
+    owns_rax_bag_ = false;
+  }
+  hash_map_bag_ = nullptr;
+}
+
 std::unique_ptr<EntriesFetcherIteratorBase> Tag::EntriesFetcher::Begin() {
-  return std::make_unique<EntriesFetcherIterator>(matched_slots_, extras_);
+  return std::make_unique<EntriesFetcherIterator>(postings_, extras_);
 }
 
 // TODO: b/357027854 - Support Suffix/Infix Search
 std::unique_ptr<EntriesFetcherBase> Tag::Search(
     const query::TagPredicate &predicate, bool negate) const {
-  // Collect matched rax slots (each slot's 8 bytes encode a bag) without
-  // iterating their postings; the iterator yields lazily during Begin().
-  absl::flat_hash_set<void *> seen;
-  std::vector<void *> matched_slots;
+  // Collect matched posting lists without iterating their keys; the fetcher
+  // yields keys lazily during Begin().
+  absl::flat_hash_set<const void *> seen;
+  std::vector<EntriesFetcherIterator::PostingListRef> matched_postings;
   size_t total = 0;
 
-  auto collect_slot = [&](void *slot) {
+  auto collect_rax_slot = [&](void *slot) {
     if (!slot || !seen.insert(slot).second) {
       return;
     }
-    matched_slots.push_back(slot);
+    matched_postings.push_back(
+        {.rax_storage = SlotToStorage(slot), .hash_map_bag = nullptr});
     auto bag = BagOfInternedStringPtrs::Adopt(SlotToStorage(slot));
     total += bag.size();
     (void)bag.Release();
   };
+  auto collect_hash_map_bag = [&](const KeySet &bag) {
+    if (!seen.insert(&bag).second) {
+      return;
+    }
+    matched_postings.push_back({.rax_storage = 0, .hash_map_bag = &bag});
+    total += bag.size();
+  };
 
   for (absl::string_view tag : predicate.GetTags()) {
     const bool is_prefix = !tag.empty() && tag.back() == '*';
+    CHECK(!is_prefix || !use_hash_map_)
+        << "HASHMAP TAG prefix queries must be rejected by the query parser";
     absl::string_view q = is_prefix ? tag.substr(0, tag.size() - 1) : tag;
     std::string norm = Normalize(q);
+    if (use_hash_map_) {
+      auto it = hash_map_.find(norm);
+      if (it != hash_map_.end()) {
+        collect_hash_map_bag(it->second);
+      }
+      continue;
+    }
     auto *qbytes =
         reinterpret_cast<unsigned char *>(const_cast<char *>(norm.data()));
 
@@ -447,14 +504,14 @@ std::unique_ptr<EntriesFetcherBase> Tag::Search(
       // exact search
       void *p = nullptr;
       if (raxFind(tree_, qbytes, norm.size(), &p) == 1) {
-        collect_slot(p);
+        collect_rax_slot(p);
       }
     } else {
       raxIterator it;
       raxStart(&it, tree_);
       raxSeekSubTree(&it, qbytes, norm.size());
       while (raxNext(&it)) {
-        collect_slot(it.data);
+        collect_rax_slot(it.data);
       }
       raxStop(&it);
     }
@@ -465,31 +522,41 @@ std::unique_ptr<EntriesFetcherBase> Tag::Search(
 
   if (negate) {
     // Yield every posting NOT in `seen`, plus every untracked key.
-    std::vector<void *> negate_slots;
+    std::vector<EntriesFetcherIterator::PostingListRef> negate_postings;
     size_t negate_total = 0;
-    raxIterator it;
-    raxStart(&it, tree_);
-    unsigned char empty = 0;
-    raxSeekSubTree(&it, &empty, 0);
-    while (raxNext(&it)) {
-      if (it.data && !seen.contains(it.data)) {
-        negate_slots.push_back(it.data);
-        auto bag = BagOfInternedStringPtrs::Adopt(SlotToStorage(it.data));
-        negate_total += bag.size();
-        (void)bag.Release();
+    if (use_hash_map_) {
+      for (const auto &[_, bag] : hash_map_) {
+        if (seen.insert(&bag).second) {
+          negate_postings.push_back({.rax_storage = 0, .hash_map_bag = &bag});
+          negate_total += bag.size();
+        }
       }
+    } else {
+      raxIterator it;
+      raxStart(&it, tree_);
+      unsigned char empty = 0;
+      raxSeekSubTree(&it, &empty, 0);
+      while (raxNext(&it)) {
+        if (it.data && seen.insert(it.data).second) {
+          negate_postings.push_back(
+              {.rax_storage = SlotToStorage(it.data), .hash_map_bag = nullptr});
+          auto bag = BagOfInternedStringPtrs::Adopt(SlotToStorage(it.data));
+          negate_total += bag.size();
+          (void)bag.Release();
+        }
+      }
+      raxStop(&it);
     }
-    raxStop(&it);
     extras.reserve(untracked_keys_.size());
     for (const auto &k : untracked_keys_) {
       extras.push_back(k);
     }
     out_size = negate_total + extras.size();
-    return std::make_unique<EntriesFetcher>(std::move(negate_slots),
+    return std::make_unique<EntriesFetcher>(std::move(negate_postings),
                                             std::move(extras), out_size);
   }
 
-  return std::make_unique<EntriesFetcher>(std::move(matched_slots),
+  return std::make_unique<EntriesFetcher>(std::move(matched_postings),
                                           std::move(extras), out_size);
 }
 
@@ -505,6 +572,10 @@ size_t Tag::GetUnTrackedKeyCount() const {
 
 size_t Tag::GetTagValueDocCount(absl::string_view value) const {
   std::string norm = Normalize(value);
+  if (use_hash_map_) {
+    auto it = hash_map_.find(norm);
+    return it == hash_map_.end() ? 0 : it->second.size();
+  }
   void *slot = nullptr;
   if (raxFind(tree_, reinterpret_cast<unsigned char *>(norm.data()),
               norm.size(), &slot) != 1) {

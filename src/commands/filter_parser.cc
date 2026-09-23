@@ -7,6 +7,7 @@
 
 #include "src/commands/filter_parser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <limits>
@@ -370,6 +371,14 @@ FilterParser::ParseTagPredicate(const std::string& attribute_alias) {
   auto tag_index = dynamic_cast<indexes::Tag*>(index.value().get());
   VMSDK_ASSIGN_OR_RETURN(auto tag_string, ParseTagString());
   VMSDK_ASSIGN_OR_RETURN(auto parsed_tags, ParseQueryTags(tag_string));
+  if (!tag_index->SupportsPrefixSearch() &&
+      std::any_of(parsed_tags.begin(), parsed_tags.end(), [](const auto& tag) {
+        return !tag.empty() && tag.back() == '*';
+      })) {
+    return absl::InvalidArgumentError(
+        "Tag prefix queries are not supported for TAG fields created with "
+        "HASHMAP.");
+  }
   query_operations_ |= QueryOperations::kContainsTag;
   return std::make_unique<query::TagPredicate>(
       tag_index, attribute_alias, identifier, tag_string, parsed_tags);

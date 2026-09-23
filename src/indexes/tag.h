@@ -8,6 +8,7 @@
 #define VALKEYSEARCH_SRC_INDEXES_TAG_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/check.h"
@@ -32,17 +34,15 @@
 
 namespace valkey_search::indexes {
 
-// Tag index backed by an in-tree vs_rax radix tree.
+// Tag index backed by either an in-tree vs_rax radix tree or a hash map.
 //
 // Storage model:
 //   - tracked_tags_by_keys_: doc-key → interned raw tag string.
 //   - untracked_keys_: doc-keys present in the dataset but without any tag.
-//   - tree_ (rax): per-normalized-tag posting list. The rax key bytes are
-//     the lowercased tag (or raw bytes when case-sensitive); the rax value
-//     slot's 8 bytes ARE the storage of a BagOfInternedStringPtrs holding
-//     the doc-keys posted to that tag. The bag picks one of four
-//     representations (Single / Array4 / Array8 / Set) by size; storage = 0
-//     means the rax key has been erased.
+//   - tree_ (rax), or hash_map_: normalized tag → posting list. The rax
+//     variant stores the bag's bits in each value slot; the hash-map variant
+//     stores the bag directly as the mapped value. Each bag chooses one of
+//     four representations (Single / Array4 / Array8 / Set) by size.
 class Tag : public IndexBase {
  public:
   using KeySet = BagOfInternedStringPtrs;
@@ -99,20 +99,24 @@ class Tag : public IndexBase {
   // Returns whether `key` carries tag value `value`. `value` is normalized
   // (lowercased unless case-sensitive) before lookup, so callers pass the raw
   // query value. Unlike GetValue, this avoids parsing/allocating the document's
-  // tag set per call: it looks the value up in the rax and tests the key
-  // against that value's posting bag. Lock-free like GetValue, relying on the
-  // read-side invariant that the index is not mutated while the time-sliced
-  // mutex is held in read mode.
-  // Borrowed key: the only caller is the scoring walk, which holds the lock.
+  // tag set per call: it looks the value up in the selected storage and tests
+  // the key against that value's posting bag. Lock-free like GetValue, relying
+  // on the read-side invariant that the index is not mutated while the
+  // time-sliced mutex is held in read mode. Borrowed key: the only caller is
+  // the scoring walk, which holds the lock.
   bool ContainsKey(absl::string_view value, BorrowedInternedStringPtr key) const
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
-  // Iterator yielded by EntriesFetcher::Begin(). Walks a vector of rax slots
-  // (each slot's 8 bytes encode a BagOfInternedStringPtrs); for negated
-  // queries, also walks an extras vector of untracked keys.
+  // Iterator yielded by EntriesFetcher::Begin(). Walks matched posting lists;
+  // for negated queries, also walks an extras vector of untracked keys.
   class EntriesFetcherIterator : public EntriesFetcherIteratorBase {
    public:
-    EntriesFetcherIterator(const std::vector<void *> &slots,
+    struct PostingListRef {
+      uintptr_t rax_storage{0};
+      const KeySet *hash_map_bag{nullptr};
+    };
+
+    EntriesFetcherIterator(const std::vector<PostingListRef> &postings,
                            const std::vector<InternedStringPtr> &extras);
     ~EntriesFetcherIterator() override;
     bool Done() const override;
@@ -122,32 +126,35 @@ class Tag : public IndexBase {
    private:
     void AdvanceToNextNonEmpty();
 
-    const std::vector<void *> &slots_;
+    void ReleaseCurrentPosting();
+
+    const std::vector<PostingListRef> &postings_;
     const std::vector<InternedStringPtr> &extras_;
-    size_t slot_idx_{0};
-    bool slots_done_{false};
+    size_t posting_idx_{0};
+    bool postings_done_{false};
     size_t extras_idx_{0};
-    // Adopts the current slot's bag storage; Release()d before moving on so
-    // the live storage stays in the rax slot.
-    BagOfInternedStringPtrs bag_;
-    BagOfInternedStringPtrs::const_iterator bag_it_;
-    BagOfInternedStringPtrs::const_iterator bag_end_;
+    // rax_bag_ adopts slot storage; hash_map_bag_ borrows the mapped value.
+    BagOfInternedStringPtrs rax_bag_;
+    const KeySet *hash_map_bag_{nullptr};
+    bool owns_rax_bag_{false};
+    BagOfInternedStringPtrs::const_iterator posting_it_;
+    BagOfInternedStringPtrs::const_iterator posting_end_;
     InternedStringPtr current_;
   };
 
   class EntriesFetcher : public EntriesFetcherBase {
    public:
-    EntriesFetcher(std::vector<void *> matched_slots,
+    EntriesFetcher(std::vector<EntriesFetcherIterator::PostingListRef> postings,
                    std::vector<InternedStringPtr> extras, size_t size)
         : size_(size),
-          matched_slots_(std::move(matched_slots)),
+          postings_(std::move(postings)),
           extras_(std::move(extras)) {}
     size_t Size() const override { return size_; }
     std::unique_ptr<EntriesFetcherIteratorBase> Begin() override;
 
    private:
     size_t size_;
-    std::vector<void *> matched_slots_;
+    std::vector<EntriesFetcherIterator::PostingListRef> postings_;
     std::vector<InternedStringPtr> extras_;
   };
 
@@ -158,11 +165,12 @@ class Tag : public IndexBase {
 
   char GetSeparator() const { return separator_; }
   bool IsCaseSensitive() const { return case_sensitive_; }
+  bool SupportsPrefixSearch() const { return !use_hash_map_; }
 
   // Number of documents carrying tag value `value` (0 if the value is absent).
   // `value` is normalized (lowercased unless case-sensitive) before lookup, so
   // callers pass the raw query value. Feeds the BM25 IDF document frequency
-  // (dt) for tag scoring. O(1) rax lookup plus a bag size read.
+  // (dt) for tag scoring. O(1) lookup plus a bag size read.
   size_t GetTagValueDocCount(absl::string_view value) const
       ABSL_LOCKS_EXCLUDED(index_mutex_);
 
@@ -198,7 +206,10 @@ class Tag : public IndexBase {
   KeySet untracked_keys_ ABSL_GUARDED_BY(index_mutex_);
   const char separator_;
   const bool case_sensitive_;
+  const bool use_hash_map_;
   rax *tree_ ABSL_GUARDED_BY(index_mutex_);
+  absl::flat_hash_map<std::string, KeySet> hash_map_
+      ABSL_GUARDED_BY(index_mutex_);
 };
 
 }  // namespace valkey_search::indexes

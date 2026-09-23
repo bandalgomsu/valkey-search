@@ -62,6 +62,7 @@ An array of key value pairs.
 
 - `SEPARATOR` (string) The actual separator character.
 - `CASESENSITIVE` (number) 0 or 1.
+- `HASHMAP` (number) 1 if tag values use hash map storage, otherwise 0.
 - `SIZE` Number of keys that have this tag attribute present.
 
 ### TEXT Field Type Extension

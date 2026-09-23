@@ -244,6 +244,8 @@ TEST_P(FTCreateParserTest, ParseParams) {
                   test_case.tag_parameters[tag_index].separator);
         EXPECT_EQ(tag_proto.case_sensitive(),
                   test_case.tag_parameters[tag_index].case_sensitive);
+        EXPECT_EQ(tag_proto.use_hash_map(),
+                  test_case.tag_parameters[tag_index].use_hash_map);
         ++tag_index;
       } else if (test_case.expected.attributes[i].indexer_type ==
                  indexes::IndexerType::kText) {
@@ -429,7 +431,7 @@ INSTANTIATE_TEST_SUITE_P(
                  "ENGLISh SCORE 1.0 SChema hash_field20 as "
                  "hash_field20 tag SEPARATOR '|' CASESENSITIVE hash_field21 as "
                  "hash_field21 tag SEPARATOR $ hash_field22 as "
-                 "hash_field22 tag  hash_field1 as "
+                 "hash_field22 tag HASHMAP hash_field1 as "
                  "hash_field11 vector hnsw 14 TYPE  FLOAT32 DIM 3  "
                  "DISTANCE_METRIC IP M 2 EF_CONSTRUCTION 5 "
                  " INITIAL_CAP 15000 EF_RUNTIME 25 ",
@@ -455,6 +457,7 @@ INSTANTIATE_TEST_SUITE_P(
                                 {
                                     .separator = ",",
                                     .case_sensitive = false,
+                                    .use_hash_map = true,
                                 }},
              .expected =
                  {.index_schema_name = "idx1",

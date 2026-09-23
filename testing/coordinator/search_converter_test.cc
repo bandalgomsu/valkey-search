@@ -18,6 +18,7 @@
 #include "src/coordinator/coordinator.pb.h"
 #include "src/index_schema.h"
 #include "src/indexes/numeric.h"
+#include "src/indexes/tag.h"
 #include "src/indexes/text.h"
 #include "src/query/predicate.h"
 #include "testing/common.h"
@@ -92,6 +93,23 @@ class SearchConverterTest : public ValkeySearchTest {
   std::shared_ptr<MockIndexSchema> index_schema_;
   std::shared_ptr<indexes::text::TextIndexSchema> text_index_schema_;
 };
+
+TEST_F(SearchConverterTest, HashMapTagPrefixPredicateIsRejected) {
+  auto tag_proto = CreateTagIndexProto();
+  tag_proto.set_use_hash_map(true);
+  auto tag_index = std::make_shared<indexes::Tag>(tag_proto);
+  VMSDK_EXPECT_OK(index_schema_->AddIndex("tag_field", "tag_field", tag_index));
+
+  Predicate predicate;
+  predicate.mutable_tag()->set_attribute_alias("tag_field");
+  predicate.mutable_tag()->set_raw_tag_string("foo*");
+  absl::flat_hash_set<std::string> identifiers;
+
+  auto result = GRPCPredicateToPredicate(predicate, index_schema_, identifiers);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), ::testing::HasSubstr("HASHMAP"));
+}
 
 // Each of the five text predicate kinds must carry its own field mask across
 // the wire *and* report the identifiers that mask selects. Reading the mask off

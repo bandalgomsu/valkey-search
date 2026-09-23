@@ -99,6 +99,7 @@ constexpr absl::string_view kWithOffsetsParam{"WITHOFFSETS"};
 constexpr absl::string_view kNoOffsetsParam{"NOOFFSETS"};
 constexpr absl::string_view kWithSuffixTrieParam{"WITHSUFFIXTRIE"};
 constexpr absl::string_view kNoSuffixTrieParam{"NOSUFFIXTRIE"};
+constexpr absl::string_view kHashMapParam{"HASHMAP"};
 constexpr absl::string_view kNoStopWordsParam{"NOSTOPWORDS"};
 constexpr absl::string_view kStopWordsParam{"STOPWORDS"};
 constexpr absl::string_view kNoStemParam{"NOSTEM"};
@@ -429,6 +430,8 @@ vmsdk::KeyValueParser<FTCreateTagParameters> CreateTagParser() {
   parser.AddParamParser(
       kCaseSensitiveParam,
       GENERATE_FLAG_PARSER(FTCreateTagParameters, case_sensitive));
+  parser.AddParamParser(
+      kHashMapParam, GENERATE_FLAG_PARSER(FTCreateTagParameters, use_hash_map));
   return parser;
 }
 absl::Status ParseTag(vmsdk::ArgsIterator &itr, data_model::Index &index_proto,
@@ -449,6 +452,7 @@ absl::Status ParseTag(vmsdk::ArgsIterator &itr, data_model::Index &index_proto,
   }
   tag_index_proto->set_separator(parameters.separator);
   tag_index_proto->set_case_sensitive(parameters.case_sensitive);
+  tag_index_proto->set_use_hash_map(parameters.use_hash_map);
   index_proto.set_allocated_tag_index(tag_index_proto.release());
   return absl::OkStatus();
 }

@@ -38,6 +38,7 @@ const std::vector<std::string> kDefaultStopWords{
 struct FTCreateTagParameters {
   absl::string_view separator{","};
   bool case_sensitive{false};
+  bool use_hash_map{false};
 };
 
 constexpr int kDefaultInitialCap{10 * 1024};

@@ -24,7 +24,7 @@ FT.CREATE <index-name>
         (
             <field-identifier> [AS <field-alias>]
                   NUMERIC
-                | TAG [SEPARATOR <sep>] [CASESENSITIVE]
+                | TAG [SEPARATOR <sep>] [CASESENSITIVE] [HASHMAP]
                 | TEXT [NOSTEM] [WITHSUFFIXTRIE | NOSUFFIXTRIE] [WEIGHT <weight>]
                 | VECTOR [HNSW | FLAT] <attr_count> [<attribute_name> <attribute_value>]+
             [SORTABLE]
@@ -67,6 +67,7 @@ FT.CREATE <index-name>
 
 - `SEPARATOR <sep>` (optional): One of these characters `,.<>{}[]"':;!@#$%^&*()-+=~` used to delimit individual tags. If omitted the default value is `,`.
 - `CASESENSITIVE` (optional): If present, tag comparisons will be case sensitive. The default is that tag comparisons are NOT case sensitive.
+- `HASHMAP` (optional): Stores TAG values in a hash map instead of a prefix tree. Tag prefix queries (for example, `@color:{blu*}`) are not supported for this field. This option does not guarantee lower memory use or faster searches; compare it with your workload. By default, TAG values use a prefix tree.
 
 See [Tag Field Format](../topics/search-data-formats.md#tag-fields) for more details and examples.
 

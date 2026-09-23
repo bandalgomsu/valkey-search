@@ -7,6 +7,7 @@
 
 #include "src/coordinator/search_converter.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -121,6 +122,15 @@ static absl::StatusOr<std::unique_ptr<query::Predicate>> BuildPredicateFromGRPC(
       VMSDK_ASSIGN_OR_RETURN(
           auto parsed_tags,
           FilterParser::ParseQueryTags(predicate.tag().raw_tag_string()));
+      if (!tag_index->SupportsPrefixSearch() &&
+          std::any_of(parsed_tags.begin(), parsed_tags.end(),
+                      [](const auto& tag) {
+                        return !tag.empty() && tag.back() == '*';
+                      })) {
+        return absl::InvalidArgumentError(
+            "Tag prefix queries are not supported for TAG fields created with "
+            "HASHMAP.");
+      }
       auto tag_predicate = std::make_unique<query::TagPredicate>(
           tag_index, predicate.tag().attribute_alias(), identifier,
           predicate.tag().raw_tag_string(), parsed_tags);

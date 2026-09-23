@@ -37,6 +37,14 @@ FT.CREATE idx SCHEMA color TAG CASESENSITIVE
 
 When `CASESENSITIVE` is not set, tags like `"Blue"` and `"blue"` are treated as equivalent during search. When `CASESENSITIVE` is set, they are treated as distinct values.
 
+### Hash Map Storage
+
+The `HASHMAP` option stores tag values in a hash map instead of the default prefix tree. It supports exact tag matching, but tag prefix queries are rejected for that field. It does not guarantee lower memory use or faster searches; compare it with your workload.
+
+```
+FT.CREATE idx SCHEMA color TAG HASHMAP
+```
+
 ### Ingestion Separator vs. Query Separator
 
 The separator specified in `FT.CREATE` applies only during data ingestion. In query expressions (`FT.SEARCH`), the separator between tags is always `|` (pipe), regardless of the ingestion separator. See the [query documentation](search-query.md#tag-match) for details.

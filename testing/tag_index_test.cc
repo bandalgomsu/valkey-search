@@ -33,6 +33,16 @@ class TagIndexTest : public vmsdk::ValkeyTest {
     index = std::make_unique<IndexTeser<Tag, data_model::TagIndex>>(
         tag_index_proto);
   }
+
+  void UseHashMap(bool case_sensitive = false) {
+    data_model::TagIndex tag_index_proto;
+    tag_index_proto.set_separator(",");
+    tag_index_proto.set_case_sensitive(case_sensitive);
+    tag_index_proto.set_use_hash_map(true);
+    index = std::make_unique<IndexTeser<Tag, data_model::TagIndex>>(
+        tag_index_proto);
+  }
+
   std::unique_ptr<IndexTeser<Tag, data_model::TagIndex>> index;
   std::string identifier = "attribute_id";
   std::string alias = "attribute_alias";
@@ -199,6 +209,72 @@ TEST_F(TagIndexTest, GetTagValueDocCountReflectsRemoval) {
   EXPECT_EQ(index->GetTagValueDocCount("red"), 1u);
   EXPECT_TRUE(index->RemoveRecord("d2").value());
   EXPECT_EQ(index->GetTagValueDocCount("red"), 0u);
+}
+
+TEST_F(TagIndexTest, HashMapExactSearchAndCaseSensitivity) {
+  UseHashMap();
+  EXPECT_TRUE(index->AddRecord("doc1", "Red").value());
+  EXPECT_TRUE(index->AddRecord("doc2", "blue").value());
+
+  std::string query_string = "RED";
+  auto parsed_tags = FilterParser::ParseQueryTags(query_string).value();
+  auto entries_fetcher =
+      index->Search(query::TagPredicate(index.get(), alias, identifier,
+                                        query_string, parsed_tags),
+                    false);
+  EXPECT_THAT(Fetch(*entries_fetcher), testing::UnorderedElementsAre("doc1"));
+  EXPECT_EQ(index->GetTagValueDocCount("red"), 1u);
+  EXPECT_TRUE(index->ToProto()->tag_index().use_hash_map());
+
+  UseHashMap(/*case_sensitive=*/true);
+  EXPECT_TRUE(index->AddRecord("doc1", "Red").value());
+  query_string = "red";
+  parsed_tags = FilterParser::ParseQueryTags(query_string).value();
+  entries_fetcher =
+      index->Search(query::TagPredicate(index.get(), alias, identifier,
+                                        query_string, parsed_tags),
+                    false);
+  EXPECT_TRUE(Fetch(*entries_fetcher).empty());
+  query_string = "Red";
+  parsed_tags = FilterParser::ParseQueryTags(query_string).value();
+  entries_fetcher =
+      index->Search(query::TagPredicate(index.get(), alias, identifier,
+                                        query_string, parsed_tags),
+                    false);
+  EXPECT_THAT(Fetch(*entries_fetcher), testing::UnorderedElementsAre("doc1"));
+}
+
+TEST_F(TagIndexTest, HashMapMutationAndNegativeSearch) {
+  UseHashMap();
+  EXPECT_TRUE(index->AddRecord("doc1", "red").value());
+  EXPECT_TRUE(index->AddRecord("doc2", "blue").value());
+  EXPECT_FALSE(index->AddRecord("doc3", " ").value());
+
+  EXPECT_TRUE(index->ModifyRecord("doc1", "green").value());
+  EXPECT_EQ(index->GetTagValueDocCount("red"), 0u);
+  EXPECT_EQ(index->GetTagValueDocCount("green"), 1u);
+
+  std::string query_string = "green";
+  auto parsed_tags = FilterParser::ParseQueryTags(query_string).value();
+  query::TagPredicate predicate(index.get(), alias, identifier, query_string,
+                                parsed_tags);
+  auto positive = index->Search(predicate, false);
+  EXPECT_THAT(Fetch(*positive), testing::UnorderedElementsAre("doc1"));
+  auto negative = index->Search(predicate, true);
+  EXPECT_THAT(Fetch(*negative), testing::UnorderedElementsAre("doc2", "doc3"));
+
+  EXPECT_TRUE(index->RemoveRecord("doc1").value());
+  EXPECT_EQ(index->GetTagValueDocCount("green"), 0u);
+}
+
+TEST_F(TagIndexTest, HashMapPrefixSearchFailsFastIfParserIsBypassed) {
+  UseHashMap();
+  std::string query_string = "dis*";
+  auto parsed_tags = FilterParser::ParseQueryTags(query_string).value();
+  query::TagPredicate predicate(index.get(), alias, identifier, query_string,
+                                parsed_tags);
+  EXPECT_DEATH(index->Search(predicate, false),
+               "HASHMAP TAG prefix queries must be rejected");
 }
 
 TEST_F(TagIndexTest, PrefixSearchHappyTest) {

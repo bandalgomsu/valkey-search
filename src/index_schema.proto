@@ -77,6 +77,7 @@ message NumericIndex {}
 message TagIndex {
   string separator = 1;
   bool case_sensitive = 2;
+  bool use_hash_map = 3;
 }
 
 message TrackedKeyMetadata {
@@ -120,4 +121,3 @@ message HNSWAlgorithm {
 message FlatAlgorithm {
   uint32 block_size = 1;
 }
-

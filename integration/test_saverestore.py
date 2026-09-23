@@ -264,6 +264,42 @@ class TestZeroLengthKeySaveRestore(ValkeySearchTestCaseDebugMode):
         assert result[0] == 1
         assert result[1] == b""
 
+    def test_tag_hashmap_save_restore(self):
+        self.client.execute_command(
+            "FT.CREATE", "tag_idx", "ON", "HASH", "PREFIX", "1", "doc:",
+            "SCHEMA", "tags", "TAG", "HASHMAP", "strict", "TAG",
+            "HASHMAP", "CASESENSITIVE",
+        )
+        self.client.execute_command("HSET", "doc:1", "tags", "Red,blue", "strict", "Red")
+        self.client.execute_command("HSET", "doc:2", "tags", "red,green", "strict", "red")
+        self.client.execute_command("HSET", "doc:3", "tags", "blue", "strict", "Blue")
+        wait_for_backfill_complete(self.client, "tag_idx")
+
+        def assert_hashmap_behavior():
+            insensitive = self.client.execute_command(
+                "FT.SEARCH", "tag_idx", "@tags:{RED}"
+            )
+            assert set(insensitive[1::2]) == {b"doc:1", b"doc:2"}
+            sensitive = self.client.execute_command(
+                "FT.SEARCH", "tag_idx", "@strict:{red}"
+            )
+            assert sensitive[1] == b"doc:2"
+            negative = self.client.execute_command(
+                "FT.SEARCH", "tag_idx", "-@tags:{RED}"
+            )
+            assert negative[0] == 1
+            assert negative[1] == b"doc:3"
+            with pytest.raises(ResponseError, match="prefix queries are not supported"):
+                self.client.execute_command("FT.SEARCH", "tag_idx", "@tags:{re*}")
+            info = FTInfoParser(self.client.execute_command("FT.INFO", "tag_idx"))
+            assert info.get_attribute_by_name("tags")["HASHMAP"] == 1
+
+        assert_hashmap_behavior()
+        self.client.execute_command("SAVE")
+        self.server.restart(remove_rdb=False)
+        wait_for_backfill_complete(self.client, "tag_idx")
+        assert_hashmap_behavior()
+
     @pytest.mark.parametrize(
         "index_type,extra_args",
         [
