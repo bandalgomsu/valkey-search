@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
@@ -66,6 +67,7 @@ constexpr uint32_t kDialect{2};
 
 // Parser keywords
 constexpr absl::string_view kParamsParam{"PARAMS"};
+constexpr absl::string_view kJParamsParam{"JPARAMS"};
 constexpr absl::string_view kDialectParam{"DIALECT"};
 constexpr absl::string_view kLimitParam{"LIMIT"};
 constexpr absl::string_view kNoContentParam{"NOCONTENT"};
@@ -249,6 +251,9 @@ struct SearchParameters {
     mutable absl::flat_hash_map<absl::string_view,
                                 std::pair<int, absl::string_view>>
         params;
+    // Names of the params supplied through JPARAMS. Their values are JSON and
+    // are converted when substituted, e.g. a JSON array into a query vector.
+    absl::flat_hash_set<absl::string_view> json_params;
     void ClearAtEndOfParse() {
       query_string = absl::string_view();
       score_as_string = absl::string_view();
@@ -256,6 +261,7 @@ struct SearchParameters {
       k_string = absl::string_view();
       ef_string = absl::string_view();
       params.clear();
+      json_params.clear();
     }
   } parse_vars;
   // Set for a VSIM arm carrying a FILTER: the filter decides which documents
@@ -380,6 +386,11 @@ bool QueryHasTextPredicate(const SearchParameters &parameters);
 
 // Check if no results should be returned based on limit parameters
 bool ShouldReturnNoResults(const SearchParameters &parameters);
+
+// Converts a JPARAMS value, a JSON array of numbers, into the binary query
+// vector format of `vector_index`.
+absl::StatusOr<std::string> JsonToQueryVector(
+    absl::string_view json, const indexes::VectorBase &vector_index);
 
 // Scans for the vector filter delimiter `=>` that is followed by `[` (after
 // optional whitespace). Returns the position of `=>` or npos if not found.
