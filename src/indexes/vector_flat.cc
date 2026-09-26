@@ -233,7 +233,7 @@ absl::StatusOr<std::vector<Neighbor>> VectorFlat<T>::Search(
   double reciprocal_magnitude =
       normalize_ ? CalcReciprocalMagnitude(
                        reinterpret_cast<const T *>(query.data()), dimensions_)
-                 : 1.0f;
+                 : kDefaultMagnitude;
 
   try {
     CancelCondition canceler(cancellation_token);

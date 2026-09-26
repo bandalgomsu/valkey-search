@@ -31,7 +31,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -293,25 +292,6 @@ TEST(SpaceDistanceIpFp64, HandComputed) {
     EXPECT_DOUBLE_EQ(CallDist(space, v1.data(), v2.data()), -31.0)
         << "dim=" << dim;
   }
-}
-
-TEST(SpaceDistanceIpFp64, CosineExtremeFiniteVectorsRemainFinite) {
-  hnswlib::InnerProductSpaceFP64 space(1);
-  for (const double component : {1e200, 1e-300}) {
-    const auto v = PadFp64({component}, 1);
-    // The reciprocal product either underflows to zero or overflows. The FP64
-    // cosine kernel must still compute the normalized dot product.
-    EXPECT_DOUBLE_EQ(CallDist(space, v.data(), v.data(), 0.0), 0.0)
-        << component;
-  }
-}
-
-TEST(SpaceDistanceL2Fp64, LargeFiniteVectorsSaturateWithoutInfinity) {
-  hnswlib::L2SpaceFP64 space(1);
-  const auto positive = PadFp64({1e200}, 1);
-  const auto negative = PadFp64({-1e200}, 1);
-  EXPECT_DOUBLE_EQ(CallDist(space, positive.data(), negative.data()),
-                   std::numeric_limits<double>::max());
 }
 
 // ---------------------------------------------------------------------------

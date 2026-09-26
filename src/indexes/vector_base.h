@@ -350,8 +350,8 @@ class VectorBase : public IndexBase {
   // about a different one. Taking the bytes as an argument is what keeps this
   // callable from the main thread, where the index structures are not held
   // under a reader lock.
-  absl::StatusOr<float> RecomputeDistance(absl::string_view record,
-                                          absl::string_view query) const;
+  absl::StatusOr<double> RecomputeDistance(absl::string_view record,
+                                           absl::string_view query) const;
   const InternedStringPtr &GetInternedAttributeIdentifier() const {
     return interned_attribute_identifier_;
   }

@@ -10,7 +10,6 @@
 #include <sys/types.h>
 
 #include <algorithm>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -54,71 +53,22 @@ namespace valkey_search {
 
 namespace indexes {
 
-namespace {
-
-// Holds the scale selected for a FLOAT64 vector. Subnormal values need a
-// bit-based ratio because -ffast-math may flush them to zero in arithmetic.
-class Float64Scale {
- public:
-  static Float64Scale From(const double *src, size_t size) {
-    uint64_t max_abs_bits = 0;
-    for (size_t i = 0; i < size; ++i) {
-      max_abs_bits = std::max(max_abs_bits,
-                              std::bit_cast<uint64_t>(src[i]) & kMagnitudeMask);
-    }
-    return Float64Scale(max_abs_bits);
-  }
-
-  bool IsZero() const { return max_abs_bits_ == 0; }
-
-  double Reciprocal() const {
-    return 1.0 / std::bit_cast<double>(max_abs_bits_);
-  }
-
-  double Scale(double value) const {
-    if (!IsSubnormal()) {
-      return value / std::bit_cast<double>(max_abs_bits_);
-    }
-    const uint64_t bits = std::bit_cast<uint64_t>(value);
-    const double scaled = static_cast<double>(bits & kMagnitudeMask) /
-                          static_cast<double>(max_abs_bits_);
-    return (bits >> 63) == 0 ? scaled : -scaled;
-  }
-
- private:
-  static constexpr uint64_t kExponentMask = 0x7ff0000000000000ULL;
-  static constexpr uint64_t kMagnitudeMask = 0x7fffffffffffffffULL;
-
-  explicit Float64Scale(uint64_t max_abs_bits) : max_abs_bits_(max_abs_bits) {}
-
-  bool IsSubnormal() const { return (max_abs_bits_ & kExponentMask) == 0; }
-
-  uint64_t max_abs_bits_;
-};
-
-}  // namespace
+// FLOAT64 is accumulated and scaled in double; every other type in float.
+template <typename T>
+using MagnitudeComputeT =
+    std::conditional_t<std::is_same_v<T, double>, double, float>;
 
 template <typename T>
 double CalcReciprocalMagnitude(const T *src, size_t size) {
-  if constexpr (!std::is_same_v<T, double>) {
-    float sum_sq = 0.0f;
-    for (size_t i = 0; i < size; i++) {
-      const float value = static_cast<float>(src[i]);
-      sum_sq += value * value;
-    }
-    return (sum_sq == 0.0f) ? 1.0f : (1.0f / std::sqrt(sum_sq));
-  } else {
-    // Scale before squaring so ordinary FLOAT64 values such as 1e200 do not
-    // overflow, and values such as 1e-300 do not underflow to zero.
-    const Float64Scale scale = Float64Scale::From(src, size);
-    if (scale.IsZero()) return 1.0;
-    double sum_sq = 0.0;
-    for (size_t i = 0; i < size; i++) {
-      const double scaled = scale.Scale(src[i]);
-      sum_sq += scaled * scaled;
-    }
-    return scale.Reciprocal() / std::sqrt(sum_sq);
+  // Accumulate in float even when T is 2 bytes: squaring a half-precision
+  // value overflows its own exponent range well before it overflows float.
+  using ComputeT = MagnitudeComputeT<T>;
+  ComputeT sum_sq = 0;
+  for (size_t i = 0; i < size; i++) {
+    const ComputeT value = static_cast<ComputeT>(src[i]);
+    sum_sq += value * value;
   }
+  return (sum_sq == 0) ? ComputeT{1} : (ComputeT{1} / std::sqrt(sum_sq));
 }
 
 template double CalcReciprocalMagnitude<float>(const float *, size_t);
@@ -151,98 +101,23 @@ double CalcReciprocalMagnitude(absl::string_view record,
 }
 
 template <typename T>
-std::vector<char> NormalizeStandardVector(absl::string_view record,
-                                          double reciprocal_magnitude) {
+std::vector<char> NormalizeVector(absl::string_view record,
+                                  double reciprocal_magnitude) {
   if (ABSL_PREDICT_FALSE(reciprocal_magnitude == 0.0)) {
     reciprocal_magnitude = 1.0;
   }
+  using ComputeT = MagnitudeComputeT<T>;
+  const ComputeT scale = static_cast<ComputeT>(reciprocal_magnitude);
   size_t dimensions = record.size() / sizeof(T);
   const T *src = reinterpret_cast<const T *>(record.data());
   std::vector<char> ret(record.size());
   T *dst = reinterpret_cast<T *>(ret.data());
   for (size_t i = 0; i < dimensions; i++) {
-    // Preserve the established FLOAT32/FLOAT16/BFLOAT16 hot path.
-    dst[i] = static_cast<T>(static_cast<float>(reciprocal_magnitude) *
-                            static_cast<float>(src[i]));
+    // Scale in ComputeT, then round once back into T. Scaling in T would
+    // double-round for the 2-byte types.
+    dst[i] = static_cast<T>(scale * static_cast<ComputeT>(src[i]));
   }
   return ret;
-}
-
-std::vector<char> NormalizeFloat64Elements(absl::string_view record,
-                                           double reciprocal_magnitude) {
-  const size_t dimensions = record.size() / sizeof(double);
-  const double *src = reinterpret_cast<const double *>(record.data());
-  std::vector<char> ret(record.size());
-  double *dst = reinterpret_cast<double *>(ret.data());
-  for (size_t i = 0; i < dimensions; ++i) {
-    dst[i] = reciprocal_magnitude * src[i];
-  }
-  return ret;
-}
-
-bool IsFiniteNonZeroDouble(double value) {
-  constexpr uint64_t kExponentMask = 0x7ff0000000000000ULL;
-  constexpr uint64_t kMagnitudeMask = 0x7fffffffffffffffULL;
-  const uint64_t bits = std::bit_cast<uint64_t>(value);
-  return (bits & kExponentMask) != kExponentMask &&
-         (bits & kMagnitudeMask) != 0;
-}
-
-// FLOAT64's reciprocal magnitude can be outside the representable double
-// range even when every element is finite: 1 / DBL_TRUE_MIN is infinity.
-// Keep the normal fast path for representable reciprocals. Only when its
-// reciprocal overflows or underflows do we retain the scale while normalizing.
-std::vector<char> NormalizeFloat64Vector(absl::string_view record,
-                                         double reciprocal_magnitude) {
-  if (IsFiniteNonZeroDouble(reciprocal_magnitude)) {
-    return NormalizeFloat64Elements(record, reciprocal_magnitude);
-  }
-
-  // Each division is bounded in [-1, 1], so this path does not materialize
-  // an overflowing reciprocal magnitude.
-  const size_t dimensions = record.size() / sizeof(double);
-  const double *src = reinterpret_cast<const double *>(record.data());
-  const Float64Scale scale = Float64Scale::From(src, dimensions);
-
-  std::vector<char> ret(record.size());
-  double *dst = reinterpret_cast<double *>(ret.data());
-  if (scale.IsZero()) {
-    std::memcpy(dst, src, record.size());
-    return ret;
-  }
-
-  double scaled_sum_sq = 0.0;
-  for (size_t i = 0; i < dimensions; ++i) {
-    const double scaled = scale.Scale(src[i]);
-    scaled_sum_sq += scaled * scaled;
-  }
-  const double reciprocal_scaled_magnitude = 1.0 / std::sqrt(scaled_sum_sq);
-  for (size_t i = 0; i < dimensions; ++i) {
-    dst[i] = scale.Scale(src[i]) * reciprocal_scaled_magnitude;
-  }
-  return ret;
-}
-
-template <typename T>
-struct VectorNormalizer {
-  static std::vector<char> Normalize(absl::string_view record,
-                                     double reciprocal_magnitude) {
-    return NormalizeStandardVector<T>(record, reciprocal_magnitude);
-  }
-};
-
-template <>
-struct VectorNormalizer<double> {
-  static std::vector<char> Normalize(absl::string_view record,
-                                     double reciprocal_magnitude) {
-    return NormalizeFloat64Vector(record, reciprocal_magnitude);
-  }
-};
-
-template <typename T>
-std::vector<char> NormalizeVector(absl::string_view record,
-                                  double reciprocal_magnitude) {
-  return VectorNormalizer<T>::Normalize(record, reciprocal_magnitude);
 }
 
 template <typename T>
@@ -651,7 +526,7 @@ VectorBase::ComputeDistanceFromRecord(const InternedStringPtr &key,
       internal_id};
 }
 
-absl::StatusOr<float> VectorBase::RecomputeDistance(
+absl::StatusOr<double> VectorBase::RecomputeDistance(
     absl::string_view record, absl::string_view query) const {
   if (!IsValidSizeVector(record)) {
     return absl::InvalidArgumentError(
@@ -666,7 +541,7 @@ absl::StatusOr<float> VectorBase::RecomputeDistance(
   if (!vector_record) {
     return absl::InternalError("Could not construct a vector record");
   }
-  float query_magnitude = kDefaultMagnitude;
+  double query_magnitude = kDefaultMagnitude;
   if (normalize_) {
     query_magnitude = CalcReciprocalMagnitude(query, GetVectorDataType()) *
                       vector_record->GetReciprocalMagnitude();

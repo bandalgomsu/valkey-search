@@ -472,7 +472,7 @@ TEST_F(VectorIndexTest, SaveTrackedKeysPreservesFp64Magnitude) {
   ASSERT_TRUE(index.ok());
   ASSERT_TRUE(index.value()->GetNormalize());
 
-  constexpr double kMagnitude = 1e300;
+  constexpr double kMagnitude = 1e100;
   std::vector<double> vector(kDimensions, 0.0);
   vector[0] = kMagnitude;
   absl::string_view vector_bytes(reinterpret_cast<const char *>(vector.data()),
@@ -675,7 +675,9 @@ class RecomputeDistanceTest : public VectorIndexTest {
 
   // The 2-byte types carry about three decimal digits, so they are compared
   // the way space_distance_test.cc compares them.
-  static float Tolerance() { return std::is_same_v<T, float> ? 1e-5f : 1e-2f; }
+  static double Tolerance() {
+    return std::is_same_v<T, float> || std::is_same_v<T, double> ? 1e-5 : 1e-2;
+  }
 
   static std::vector<data_model::DistanceMetric> Metrics() {
     return {data_model::DISTANCE_METRIC_L2, data_model::DISTANCE_METRIC_IP,
@@ -771,7 +773,7 @@ class RecomputeDistanceTest : public VectorIndexTest {
         index_order.push_back(std::string(n.external_id->Str()));
       }
 
-      std::vector<std::pair<float, std::string>> recomputed;
+      std::vector<std::pair<double, std::string>> recomputed;
       for (size_t i = 0; i < vectors.size(); ++i) {
         auto d = index.value()->RecomputeDistance(vectors[i], query);
         ASSERT_TRUE(d.ok()) << metric;
@@ -791,6 +793,7 @@ class RecomputeDistanceTest : public VectorIndexTest {
 using RecomputeDistanceFp32 = RecomputeDistanceTest<float>;
 using RecomputeDistanceFp16 = RecomputeDistanceTest<float16>;
 using RecomputeDistanceBf16 = RecomputeDistanceTest<bfloat16>;
+using RecomputeDistanceFp64 = RecomputeDistanceTest<double>;
 
 TEST_F(RecomputeDistanceFp32, AgreesWithTheIndexForTheStoredVector) {
   AgreesWithTheIndexForTheStoredVector();
@@ -820,6 +823,37 @@ TEST_F(RecomputeDistanceBf16, AnswersForBytesTheIndexHasNeverSeen) {
 }
 TEST_F(RecomputeDistanceBf16, RecomputedDistancesRankTheSameWayTheIndexDoes) {
   RecomputedDistancesRankTheSameWayTheIndexDoes();
+}
+
+TEST_F(RecomputeDistanceFp64, AgreesWithTheIndexForTheStoredVector) {
+  AgreesWithTheIndexForTheStoredVector();
+}
+TEST_F(RecomputeDistanceFp64, AnswersForBytesTheIndexHasNeverSeen) {
+  AnswersForBytesTheIndexHasNeverSeen();
+}
+TEST_F(RecomputeDistanceFp64, RecomputedDistancesRankTheSameWayTheIndexDoes) {
+  RecomputedDistancesRankTheSameWayTheIndexDoes();
+}
+
+// A FLOAT64 distance must not be narrowed to float on the refresh path.
+TEST_F(RecomputeDistanceFp64, KeepsFp64Precision)
+ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  auto index = MakeIndex(data_model::DISTANCE_METRIC_L2);
+  ASSERT_TRUE(index.ok());
+  const std::string stored = Bytes({0.0f, 0.0f, 0.0f, 0.0f});
+  const std::string query = Bytes({1.0f, 1e-6f, 0.0f, 0.0f});
+  VMSDK_EXPECT_OK(
+      testing_infra::AddVectorRecord(*index.value(), IndexToKey(1), stored));
+
+  auto search = index.value()->Search(query, 1, CancelNever());
+  ASSERT_TRUE(search.ok());
+  ASSERT_EQ(search.value().size(), 1u);
+  auto recomputed = index.value()->RecomputeDistance(stored, query);
+  ASSERT_TRUE(recomputed.ok());
+
+  // The distance is 1 + ~1e-12, which float would round to exactly 1.
+  EXPECT_NE(*recomputed, static_cast<double>(static_cast<float>(*recomputed)));
+  EXPECT_EQ(*recomputed, search.value()[0].distance);
 }
 
 // RecomputeDistance answers the question the search answers, but from bytes

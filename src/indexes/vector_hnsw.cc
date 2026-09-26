@@ -279,8 +279,8 @@ absl::Status VectorHNSW<T>::AlgoDeleteRecord(uint64_t label) {
   auto norm_record = NormalizeVector<T>(unnorm_vector);
 
   absl::string_view norm_view(norm_record.data(), norm_record.size());
-  auto vector_record =
-      VectorRecord::Construct(norm_view, 1.0f, GetVectorAllocator());
+  auto vector_record = VectorRecord::Construct(norm_view, kDefaultMagnitude,
+                                               GetVectorAllocator());
   algo_->SetDataByInternalId(*hnsw_internal_id, std::move(vector_record));
   algo_->markDeletedInternal(*hnsw_internal_id);
   return absl::OkStatus();

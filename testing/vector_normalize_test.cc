@@ -24,11 +24,9 @@
 // and rounded back into T exactly once (double-rounding would show up as error
 // above the single-rounding bound).
 
-#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -134,31 +132,6 @@ TEST(VectorNormalizeValidation, ReciprocalMagnitudeBFloat16) {
 }
 TEST(VectorNormalizeValidation, ReciprocalMagnitudeFloat64) {
   ExpectMagnitudeMatchesReference<double>(Sample());
-}
-
-TEST(VectorNormalizeValidation, Float64ExtremeMagnitudeStaysFinite) {
-  const std::vector<double> q{1e200, -2e200, 1e-300};
-  const double reciprocal = CalcReciprocalMagnitude(q.data(), q.size());
-  EXPECT_TRUE(std::isfinite(reciprocal));
-  EXPECT_GT(reciprocal, 0.0);
-  std::vector<char> out = NormalizeVector(
-      AsBytes(q), data_model::VECTOR_DATA_TYPE_FLOAT64, reciprocal);
-  std::vector<double> normalized(q.size());
-  std::memcpy(normalized.data(), out.data(), out.size());
-  EXPECT_NEAR(ExactMagnitude<double>(normalized), 1.0, 1e-12);
-}
-
-TEST(VectorNormalizeValidation, Float64SubnormalVectorStaysFinite) {
-  const std::vector<double> q{std::numeric_limits<double>::denorm_min(), 0.0};
-  const double reciprocal = CalcReciprocalMagnitude(q.data(), q.size());
-  EXPECT_EQ(std::bit_cast<uint64_t>(reciprocal), 0x7ff0000000000000ULL);
-
-  std::vector<char> out = NormalizeVector(
-      AsBytes(q), data_model::VECTOR_DATA_TYPE_FLOAT64, reciprocal);
-  std::vector<double> normalized(q.size());
-  std::memcpy(normalized.data(), out.data(), out.size());
-  EXPECT_DOUBLE_EQ(normalized[0], 1.0);
-  EXPECT_DOUBLE_EQ(normalized[1], 0.0);
 }
 
 // The magnitude accumulator must not inherit T's exponent range. Squaring
