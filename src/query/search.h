@@ -218,6 +218,9 @@ struct SearchParameters {
   bool enable_consistency{options::GetPreferConsistentResults().GetValue()};
   int k{0};
   std::optional<unsigned> ef;
+  // SHARD_K_RATIO: the share of k each shard is asked for in a cluster fanout.
+  // Read only by the coordinator; shards receive the resulting k.
+  std::optional<double> shard_k_ratio;
   LimitParameter limit;
   uint64_t timeout_ms{0};
   bool no_content{false};

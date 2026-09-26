@@ -9,6 +9,8 @@
 
 #include <netinet/in.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -589,6 +591,13 @@ absl::Status PerformMultiSearchFanoutAsync(
     } else {
       // Vector arm: fetch top-k from each shard (worst case all k from one).
       per_shard_limit = std::max<uint64_t>(arm.k, window);
+      if (arm.shard_k_ratio.has_value()) {
+        // Only the first `window` of the arm's results take part in fusion,
+        // so the ratio applies to min(k, window), as the reference engine
+        // does. The coordinator still merges to arm.k.
+        req->set_k(ShardKForRatio(std::min<uint64_t>(arm.k, window), num_shards,
+                                  *arm.shard_k_ratio));
+      }
     }
     req->mutable_limit()->set_first_index(0);
     req->mutable_limit()->set_number(per_shard_limit);
@@ -701,6 +710,14 @@ absl::Status PerformMultiSearchFanoutAsync(
     }
   }
   return absl::OkStatus();
+}
+
+uint64_t ShardKForRatio(uint64_t k, size_t num_shards, double ratio) {
+  CHECK_GT(num_shards, 0u);
+  const uint64_t fair_share = (k + num_shards - 1) / num_shards;
+  const auto by_ratio =
+      static_cast<uint64_t>(std::ceil(static_cast<double>(k) * ratio));
+  return std::max(fair_share, by_ratio);
 }
 
 bool IsSystemUnderLowUtilization() {
