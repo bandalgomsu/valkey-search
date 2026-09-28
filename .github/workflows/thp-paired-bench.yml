@@ -17,6 +17,7 @@ env:
   EF_RUNTIME: "100"
   WARMUP_S: "30"
   MEASURE_S: "120"
+  SEED_RDB_URL: https://github.com/bandalgomsu/valkey-search/releases/download/thp-bench-data/dump-500000x128.rdb
 
 jobs:
   build:
@@ -149,6 +150,8 @@ jobs:
 
       - name: Start bench container
         run: |
+          # Artifacts drop the execute bit, and Valkey refuses to load a module without it.
+          chmod +x modules/A/libsearch.so modules/B/libsearch.so
           mkdir -p "$RUNNER_TEMP/work"
           cp .github/thp-bench/*.py .github/thp-bench/*.sh "$RUNNER_TEMP/work/"
           chmod -R a+rwX "$RUNNER_TEMP/work" "$RUNNER_TEMP/valkey"
@@ -168,11 +171,21 @@ jobs:
           path: ${{ runner.temp }}/work/data/dump.rdb
           key: rdb-${{ matrix.runner }}-${{ env.DOCS }}x${{ env.DIM }}-${{ env.CANDIDATE_REF }}
 
-      - name: Load ${{ env.DOCS }} x ${{ env.DIM }}-dim vectors and save RDB
+      # A prebuilt RDB attached to the fork's release skips the 30-45 minute load.
+      # It is used only if it loads with the candidate module and holds DOCS documents.
+      - name: Use seeded RDB or load ${{ env.DOCS }} x ${{ env.DIM }}-dim vectors
         if: steps.rdb.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$RUNNER_TEMP/work/data" && sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
-          docker exec bench /s/bench1m/phase.sh build "$DOCS" "$DIM" /s/bench1m/data
+          mkdir -p "$RUNNER_TEMP/work/data"
+          curl -fsSL -o "$RUNNER_TEMP/work/data/dump.rdb" "$SEED_RDB_URL" || rm -f "$RUNNER_TEMP/work/data/dump.rdb"
+          sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
+          if [ -f "$RUNNER_TEMP/work/data/dump.rdb" ] && docker exec bench /s/bench1m/phase.sh verify "$DOCS" /s/bench1m/data; then
+            echo "Using seeded RDB from $SEED_RDB_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Seeded RDB unavailable or invalid; loading from scratch"
+            rm -f "$RUNNER_TEMP/work/data/dump.rdb"
+            docker exec bench /s/bench1m/phase.sh build "$DOCS" "$DIM" /s/bench1m/data
+          fi
 
       - name: Paired measurement (CPU sets swapped between runs)
         run: |

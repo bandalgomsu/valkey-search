@@ -1,5 +1,6 @@
 #!/bin/bash
 # phase.sh build N DIM DIR -> build index with module B, SAVE to DIR/dump.rdb
+# phase.sh verify N DIR    -> load DIR/dump.rdb with module B; exit 0 only if it holds N indexed docs
 set -e
 V=/s/valkey92/src; CLI="$V/valkey-cli -p 7000"
 start() { taskset -c 0-3 $V/valkey-server --port 7000 --save "" --dir $3 --dbfilename dump.rdb \
@@ -34,4 +35,13 @@ build)
     sleep 5
   done
   echo "index built in $(( $(date +%s) - t0 ))s"; $CLI SAVE; stop; ls -la $D/dump.rdb ;;
+verify)
+  N=$2; D=$3; LOG=$D/server-verify.log; stop
+  start verify B $D; waitup $LOG
+  until $CLI INFO persistence | grep -q "loading:0"; do
+    pidof valkey-server >/dev/null || { echo "::error::valkey-server exited while loading the RDB"; tail -50 $LOG; exit 1; }
+    sleep 1
+  done
+  got=$(ftinfo num_docs); stop
+  echo "RDB holds num_docs=$got (expected $N)"; [ "$got" = "$N" ] ;;
 esac
