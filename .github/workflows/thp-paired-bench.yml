@@ -17,7 +17,6 @@ env:
   EF_RUNTIME: "100"
   WARMUP_S: "30"
   MEASURE_S: "120"
-  SEED_RDB_URL: https://github.com/bandalgomsu/valkey-search/releases/download/thp-bench-data/dump-500000x128.rdb
 
 jobs:
   build:
@@ -169,20 +168,11 @@ jobs:
           path: ${{ runner.temp }}/work/data/dump.rdb
           key: rdb-${{ matrix.runner }}-${{ env.DOCS }}x${{ env.DIM }}-${{ env.CANDIDATE_REF }}
 
-      # A prebuilt RDB attached to the fork's release skips the 25-40 minute load.
-      # It is used only if it loads with the candidate module and holds DOCS documents.
-      - name: Use seeded RDB or load ${{ env.DOCS }} x ${{ env.DIM }}-dim vectors
+      - name: Load ${{ env.DOCS }} x ${{ env.DIM }}-dim vectors and save RDB
         if: steps.rdb.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$RUNNER_TEMP/work/data"
-          curl -fsSL -o "$RUNNER_TEMP/work/data/dump.rdb" "$SEED_RDB_URL" || rm -f "$RUNNER_TEMP/work/data/dump.rdb"
-          sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
-          if [ -f "$RUNNER_TEMP/work/data/dump.rdb" ] && docker exec bench /s/bench1m/phase.sh verify "$DOCS" /s/bench1m/data; then
-            echo "Using seeded RDB from $SEED_RDB_URL" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            rm -f "$RUNNER_TEMP/work/data/dump.rdb"
-            docker exec bench /s/bench1m/phase.sh build "$DOCS" "$DIM" /s/bench1m/data
-          fi
+          mkdir -p "$RUNNER_TEMP/work/data" && sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
+          docker exec bench /s/bench1m/phase.sh build "$DOCS" "$DIM" /s/bench1m/data
 
       - name: Paired measurement (CPU sets swapped between runs)
         run: |
@@ -198,11 +188,20 @@ jobs:
             || { echo "::error::candidate has no AnonHugePages; THP was not applied"; exit 1; }
           grep -h "thp_fault" /proc/vmstat
 
+      - name: Print server logs on failure
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/work/data/server-*.log "$RUNNER_TEMP"/work/data/pair/server-*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f (last 100 lines)"; tail -100 "$f"; echo "::endgroup::"
+          done
+          free -m; df -h "$RUNNER_TEMP"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: thp-bench-results-${{ matrix.runner }}
           path: |
             ${{ runner.temp }}/work/data/pair/
-            ${{ runner.temp }}/work/data/server-build.log
+            ${{ runner.temp }}/work/data/server-*.log
           retention-days: 90
