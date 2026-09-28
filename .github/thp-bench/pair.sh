@@ -15,7 +15,8 @@ for x in "A 7001" "B 7002"; do set -- $x
   log=$D/pair/server-$1-$T.log; ok=
   for _ in $(seq 600); do
     if $V/valkey-cli -p $2 INFO persistence 2>/dev/null | grep -q "^loading:0"; then ok=1; break; fi
-    pgrep -f "valkey-server \*:$2" >/dev/null || break
+    # Match both the startup argv (--port N) and the process title set later (*:N).
+    pgrep -f "valkey-server .*(--port |\*:)$2( |$)" >/dev/null || break
     sleep 1
   done
   [ -n "$ok" ] || { echo "::error::server $1 (port $2) failed to load $D/dump.rdb"; tail -50 $log; exit 1; }
