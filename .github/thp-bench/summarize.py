@@ -1,12 +1,14 @@
-# summarize.py DIR TITLE -> Markdown table of parent (A) vs candidate (B) from pair-*.json runs
+# summarize.py DIR TITLE [SUBDIR=pair] -> Markdown table of server A vs server B from pair-*.json runs
 import glob, json, os, re, sys
 
 d, title = sys.argv[1], sys.argv[2]
-paths = sorted(glob.glob(f"{d}/pair/pair-*.json"))
+sub = sys.argv[3] if len(sys.argv) > 3 else "pair"
+label_a, label_b = os.environ.get("LABEL_A", "Parent"), os.environ.get("LABEL_B", "Candidate")
+paths = sorted(glob.glob(f"{d}/{sub}/pair-*.json"))
 runs = [json.load(open(f)) for f in paths]
 tags = [os.path.basename(f)[len("pair-"):-len(".json")] for f in paths]
 if not runs:
-    sys.exit(f"no results in {d}/pair")
+    sys.exit(f"no results in {d}/{sub}")
 
 
 def avg(fn):
@@ -19,7 +21,7 @@ def change(a, b):
 
 def read_kv(pattern):
     out = {}
-    for f in sorted(glob.glob(f"{d}/pair/{pattern}")):
+    for f in sorted(glob.glob(f"{d}/{sub}/{pattern}")):
         for line in open(f):
             k, _, v = line.strip().partition(":")
             if v:
@@ -29,7 +31,7 @@ def read_kv(pattern):
 
 def ahp(label):
     vals = []
-    for f in glob.glob(f"{d}/pair/thp-{label}-*.txt"):
+    for f in glob.glob(f"{d}/{sub}/thp-{label}-*.txt"):
         m = re.search(r"'rollup_AnonHugePages_kB': (\d+)", open(f).read())
         if m:
             vals.append(int(m.group(1)))
@@ -40,7 +42,7 @@ def perf_per_query(label):
     """Average of per-run (event count / FT.SEARCH calls) from perf stat -x, output."""
     out = {}
     for run, tag in zip(runs, tags):
-        f = f"{d}/pair/perf-{label}-{tag}.csv"
+        f = f"{d}/{sub}/perf-{label}-{tag}.csv"
         if not os.path.exists(f):
             continue
         calls = run["server"][label]["calls"]
@@ -66,7 +68,7 @@ for key, name in (("p50_us", "p50"), ("p99_us", "p99")):
     a, b = avg(lambda r: r["server"]["A"][key]), avg(lambda r: r["server"]["B"][key])
     rows.append((f"FT.SEARCH server {name} latency", f"{a:.0f} µs", f"{b:.0f} µs", change(a, b)))
 faster = " / ".join(f"{100 * r['paired_B_over_A']['B_faster_frac']:.1f}%" for r in runs)
-rows.append(("Queries where candidate was faster", "-", faster, "-"))
+rows.append((f"Queries where {label_b.lower()} was faster", "-", faster, "-"))
 mem_a, mem_b = read_kv("mem-A-*.txt"), read_kv("mem-B-*.txt")
 for key, name in (("used_memory", "`used_memory`"), ("used_memory_rss", "Server RSS")):
     if key in mem_a and key in mem_b:
@@ -86,7 +88,7 @@ if not perf_a:
 
 print(f"#### {title}\n")
 print(f"Average of {len(runs)} runs (CPU sets swapped between runs), {runs[0]['pairs']:,}+ query pairs per run.\n")
-print("| Workload / metric | Parent | Candidate | Change |")
+print(f"| Workload / metric | {label_a} | {label_b} | Change |")
 print("|---|---:|---:|---:|")
 for r in rows:
     print("| " + " | ".join(r) + " |")

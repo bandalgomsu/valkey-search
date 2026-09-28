@@ -211,7 +211,8 @@ jobs:
             done
             probe=$(sudo "$PERF" stat -x, -e "$candidates" -- sleep 1 2>&1 || true)
             echo "$probe"
-            events=$(grep -E '^[0-9.]+,' <<<"$probe" | cut -d, -f3 | paste -sd, - || true)
+            # Some VMs list the events but never count them; keep only non-zero counts.
+            events=$(grep -E '^[0-9.]*[1-9][0-9.]*,' <<<"$probe" | cut -d, -f3 | paste -sd, - || true)
           fi
           if [ -n "$events" ]; then
             echo "$PERF" > "$RUNNER_TEMP/work/perf-bin"; echo "$events" > "$RUNNER_TEMP/work/perf-events"
@@ -240,10 +241,34 @@ jobs:
           done
           grep -h "thp_fault" /proc/vmstat
 
+      # Upper bound of what THP can give this workload: the parent module run twice,
+      # once with THP disabled for the process and once with THP for the whole process
+      # (vectors, keys and level-0). Valkey's disable-thp only acts when THP is "always".
+      - name: THP ceiling (parent without THP vs parent with process-wide THP)
+        run: |
+          set_thp() {
+            echo "$1" | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
+            echo "$1" | sudo tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null
+          }
+          trap 'set_thp madvise' EXIT
+          set_thp always
+          export MOD_A=A MOD_B=A ARGS_A="--disable-thp yes" ARGS_B="--disable-thp no" OUT_SUBDIR=ceiling
+          for ds in $DATASETS; do
+            dim=${ds%%:*}
+            echo "::group::${ds} ceiling run1"; bash .github/thp-bench/host-pair.sh "$dim" run1 0 1; echo "::endgroup::"
+            echo "::group::${ds} ceiling run2"; bash .github/thp-bench/host-pair.sh "$dim" run2 1 0; echo "::endgroup::"
+          done
+          export LABEL_A="No THP" LABEL_B="Process-wide THP"
+          for ds in $DATASETS; do
+            dim=${ds%%:*}; docs=${ds##*:}
+            python3 .github/thp-bench/summarize.py "$RUNNER_TEMP/work/data-$dim" \
+              "THP ceiling: ${docs} x ${dim}-dim, parent module (${{ matrix.runner }})" ceiling | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
       - name: Print server logs on failure
         if: failure()
         run: |
-          for f in "$RUNNER_TEMP"/work/data-*/server-*.log "$RUNNER_TEMP"/work/data-*/pair/server-*.log; do
+          for f in "$RUNNER_TEMP"/work/data-*/server-*.log "$RUNNER_TEMP"/work/data-*/pair/server-*.log "$RUNNER_TEMP"/work/data-*/ceiling/server-*.log; do
             [ -f "$f" ] || continue
             echo "::group::$f (last 100 lines)"; tail -100 "$f"; echo "::endgroup::"
           done
@@ -255,5 +280,6 @@ jobs:
           name: thp-bench-results-${{ matrix.runner }}
           path: |
             ${{ runner.temp }}/work/data-*/pair/
+            ${{ runner.temp }}/work/data-*/ceiling/
             ${{ runner.temp }}/work/data-*/server-*.log
           retention-days: 90

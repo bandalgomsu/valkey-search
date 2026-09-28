@@ -2,10 +2,12 @@
 # host-pair.sh DIM TAG CPUS_A CPUS_B  (runs on the runner host, not in the container)
 # Runs pair.sh in the bench container. If perf was set up, it also counts TLB events
 # for each server process, starting when pair.py begins the measured window.
+# MOD_A, MOD_B, ARGS_A, ARGS_B and OUT_SUBDIR are passed through to pair.sh when set.
 set -e
 DIM=$1; TAG=$2; CA=$3; CB=$4
-W=$RUNNER_TEMP/work; PAIR=$W/data-$DIM/pair; MARK=$PAIR/pair-$TAG.json.measuring
-docker exec -e CLIENT_CPUS=2-3 bench /s/bench1m/pair.sh "/s/bench1m/data-$DIM" "$DIM" \
+W=$RUNNER_TEMP/work; PAIR=$W/data-$DIM/${OUT_SUBDIR:-pair}; MARK=$PAIR/pair-$TAG.json.measuring
+docker exec -e CLIENT_CPUS=2-3 -e MOD_A -e MOD_B -e ARGS_A -e ARGS_B -e OUT_SUBDIR \
+  bench /s/bench1m/pair.sh "/s/bench1m/data-$DIM" "$DIM" \
   "$WARMUP_S" "$MEASURE_S" "$CA" "$CB" "$TAG" "$EF_RUNTIME" &
 pair=$!
 perfs=()
