@@ -38,7 +38,7 @@ build)
 verify)
   N=$2; D=$3; LOG=$D/server-verify.log; stop
   start verify B $D; waitup $LOG
-  until $CLI INFO persistence | grep -q "loading:0"; do
+  until $CLI INFO persistence | grep -q "^loading:0"; do
     pidof valkey-server >/dev/null || { echo "::error::valkey-server exited while loading the RDB"; tail -50 $LOG; exit 1; }
     sleep 1
   done

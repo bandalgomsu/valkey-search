@@ -14,7 +14,7 @@ done
 for x in "A 7001" "B 7002"; do set -- $x
   log=$D/pair/server-$1-$T.log; ok=
   for _ in $(seq 600); do
-    if $V/valkey-cli -p $2 INFO persistence 2>/dev/null | grep -q "loading:0"; then ok=1; break; fi
+    if $V/valkey-cli -p $2 INFO persistence 2>/dev/null | grep -q "^loading:0"; then ok=1; break; fi
     pgrep -f "valkey-server \*:$2" >/dev/null || break
     sleep 1
   done
