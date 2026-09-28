@@ -2,7 +2,9 @@
 import glob, json, os, re, sys
 
 d, title = sys.argv[1], sys.argv[2]
-runs = [json.load(open(f)) for f in sorted(glob.glob(f"{d}/pair/pair-*.json"))]
+paths = sorted(glob.glob(f"{d}/pair/pair-*.json"))
+runs = [json.load(open(f)) for f in paths]
+tags = [os.path.basename(f)[len("pair-"):-len(".json")] for f in paths]
 if not runs:
     sys.exit(f"no results in {d}/pair")
 
@@ -34,6 +36,26 @@ def ahp(label):
     return max(vals) if vals else 0
 
 
+def perf_per_query(label):
+    """Average of per-run (event count / FT.SEARCH calls) from perf stat -x, output."""
+    out = {}
+    for run, tag in zip(runs, tags):
+        f = f"{d}/pair/perf-{label}-{tag}.csv"
+        if not os.path.exists(f):
+            continue
+        calls = run["server"][label]["calls"]
+        for line in open(f):
+            parts = line.strip().split(",")
+            if line.startswith("#") or len(parts) < 3:
+                continue
+            try:
+                value = float(parts[0])
+            except ValueError:  # <not counted> / <not supported>
+                continue
+            out.setdefault(parts[2], []).append(value / calls)
+    return {k: sum(v) / len(v) for k, v in out.items()}
+
+
 rows = []
 for key, name in (("mean_ms", "average"), ("p50_ms", "p50"), ("p90_ms", "p90"), ("p99_ms", "p99")):
     a, b = avg(lambda r: r["A"][key]), avg(lambda r: r["B"][key])
@@ -51,6 +73,16 @@ for key, name in (("used_memory", "`used_memory`"), ("used_memory_rss", "Server 
         a, b = mem_a[key] / 2**20, mem_b[key] / 2**20
         rows.append((f"{name} after measurement", f"{a:.2f} MiB", f"{b:.2f} MiB", change(a, b)))
 rows.append(("`AnonHugePages`", f"{ahp('A'):,} kB", f"{ahp('B'):,} kB", "-"))
+perf_a, perf_b = perf_per_query("A"), perf_per_query("B")
+for ev in [e for e in perf_a if e in perf_b]:
+    a, b = perf_a[ev], perf_b[ev]
+    rows.append((f"`{ev}` per query", f"{a:,.0f}", f"{b:,.0f}", change(a, b) if a else "-"))
+if all(e in perf_a and e in perf_b for e in ("dTLB-loads", "dTLB-load-misses")) and perf_a["dTLB-loads"] and perf_b["dTLB-loads"]:
+    a = 100 * perf_a["dTLB-load-misses"] / perf_a["dTLB-loads"]
+    b = 100 * perf_b["dTLB-load-misses"] / perf_b["dTLB-loads"]
+    rows.append(("dTLB load miss rate", f"{a:.3f}%", f"{b:.3f}%", change(a, b) if a else "-"))
+if not perf_a:
+    rows.append(("TLB counters (perf)", "n/a", "n/a", "-"))
 
 print(f"#### {title}\n")
 print(f"Average of {len(runs)} runs (CPU sets swapped between runs), {runs[0]['pairs']:,}+ query pairs per run.\n")

@@ -1,0 +1,12 @@
+arg: stat
+arg: stat
+arg: -x,
+arg: -x,
+arg: -e
+arg: -e
+arg: dTLB-loads,dTLB-load-misses
+arg: dTLB-loads,dTLB-load-misses
+arg: -p
+arg: -p
+arg: 
+arg: 

@@ -12,12 +12,13 @@ env:
   PARENT_REF: 17ffbe0ffb9b92374cadd35c693d76a0d6c7bda0
   CANDIDATE_REF: 965056c56342fb1e000841a02707b2840f83d667
   VALKEY_REF: "9.2"
-  DOCS: "500000"
-  DIM: "128"
+  # Space-separated DIM:DOCS pairs, measured one after another on the same runner.
+  # The 64-dim set is 472,362 docs to match the prebuilt RDB.
+  DATASETS: "128:500000 64:472362"
   EF_RUNTIME: "100"
   WARMUP_S: "30"
   MEASURE_S: "120"
-  SEED_RDB_URL: https://github.com/bandalgomsu/valkey-search/releases/download/thp-bench-data/dump-500000x128.rdb
+  SEED_RDB_BASE: https://github.com/bandalgomsu/valkey-search/releases/download/thp-bench-data
 
 jobs:
   build:
@@ -162,49 +163,87 @@ jobs:
             -v "$PWD/modules/B/libsearch.so:/m/B.so:ro" \
             bench-image sleep infinity
 
-      # The RDB depends only on the dataset and the module's serialization,
-      # so it is reused across runs of the same candidate.
-      - name: Restore RDB
-        id: rdb
+      # The RDBs depend only on the datasets and the module's serialization,
+      # so they are reused across runs of the same candidate.
+      - name: Restore RDBs
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/work/data/dump.rdb
-          key: rdb-${{ matrix.runner }}-${{ env.DOCS }}x${{ env.DIM }}-${{ env.CANDIDATE_REF }}
+          path: ${{ runner.temp }}/work/data-*/dump.rdb
+          key: rdb-${{ matrix.runner }}-${{ env.DATASETS }}-${{ env.CANDIDATE_REF }}
 
-      # A prebuilt RDB attached to the fork's release skips the 30-45 minute load.
+      # A prebuilt RDB attached to the fork's release skips a 30-45 minute load.
       # It is used only if it loads with the candidate module and holds DOCS documents.
-      - name: Use seeded RDB or load ${{ env.DOCS }} x ${{ env.DIM }}-dim vectors
-        if: steps.rdb.outputs.cache-hit != 'true'
+      - name: Prepare RDBs (cache, seeded release asset, or load from scratch)
         run: |
-          mkdir -p "$RUNNER_TEMP/work/data"
-          curl -fsSL -o "$RUNNER_TEMP/work/data/dump.rdb" "$SEED_RDB_URL" || rm -f "$RUNNER_TEMP/work/data/dump.rdb"
-          sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
-          if [ -f "$RUNNER_TEMP/work/data/dump.rdb" ] && docker exec bench /s/bench1m/phase.sh verify "$DOCS" /s/bench1m/data; then
-            echo "Using seeded RDB from $SEED_RDB_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          for ds in $DATASETS; do
+            dim=${ds%%:*}; docs=${ds##*:}; d="$RUNNER_TEMP/work/data-$dim"
+            mkdir -p "$d"
+            if [ -f "$d/dump.rdb" ]; then
+              echo "${docs} x ${dim}-dim: using cached RDB" | tee -a "$GITHUB_STEP_SUMMARY"; continue
+            fi
+            url="$SEED_RDB_BASE/dump-${docs}x${dim}.rdb"
+            curl -fsSL -o "$d/dump.rdb" "$url" || rm -f "$d/dump.rdb"
+            sudo chmod -R a+rwX "$d"
+            if [ -f "$d/dump.rdb" ] && docker exec bench /s/bench1m/phase.sh verify "$docs" "/s/bench1m/data-$dim"; then
+              echo "${docs} x ${dim}-dim: using seeded RDB $url" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "${docs} x ${dim}-dim: seeded RDB unavailable or invalid; loading from scratch" | tee -a "$GITHUB_STEP_SUMMARY"
+              rm -f "$d/dump.rdb"
+              docker exec bench /s/bench1m/phase.sh build "$docs" "$dim" "/s/bench1m/data-$dim"
+            fi
+          done
+
+      # Best effort: cloud VMs may not expose hardware counters. Only events that
+      # return a number in a one-second probe are kept; otherwise perf is skipped.
+      - name: Set up perf TLB counters (best effort)
+        run: |
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-generic >/dev/null 2>&1 || true
+          sudo sysctl -qw kernel.perf_event_paranoid=-1 || true
+          PERF=$(ls "/usr/lib/linux-tools/$(uname -r)/perf" /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true)
+          events=""
+          if [ -n "$PERF" ]; then
+            candidates="dTLB-loads,dTLB-load-misses"
+            list=$(sudo "$PERF" list 2>/dev/null || true)
+            for e in dtlb_load_misses.walk_completed dtlb_load_misses.walk_active l1d_tlb_refill l2d_tlb_refill dtlb_walk; do
+              grep -qw "$e" <<<"$list" && candidates="$candidates,$e"
+            done
+            probe=$(sudo "$PERF" stat -x, -e "$candidates" -- sleep 1 2>&1 || true)
+            echo "$probe"
+            events=$(grep -E '^[0-9.]+,' <<<"$probe" | cut -d, -f3 | paste -sd, - || true)
+          fi
+          if [ -n "$events" ]; then
+            echo "$PERF" > "$RUNNER_TEMP/work/perf-bin"; echo "$events" > "$RUNNER_TEMP/work/perf-events"
+            echo "perf counters: \`$events\`" | tee -a "$GITHUB_STEP_SUMMARY"
           else
-            echo "Seeded RDB unavailable or invalid; loading from scratch"
-            rm -f "$RUNNER_TEMP/work/data/dump.rdb"
-            docker exec bench /s/bench1m/phase.sh build "$DOCS" "$DIM" /s/bench1m/data
+            echo "perf counters: unavailable on this runner" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Paired measurement (CPU sets swapped between runs)
         run: |
-          sudo chmod -R a+rwX "$RUNNER_TEMP/work/data"
-          docker exec -e CLIENT_CPUS=2-3 bench /s/bench1m/pair.sh /s/bench1m/data "$DIM" "$WARMUP_S" "$MEASURE_S" 0 1 run1 "$EF_RUNTIME"
-          docker exec -e CLIENT_CPUS=2-3 bench /s/bench1m/pair.sh /s/bench1m/data "$DIM" "$WARMUP_S" "$MEASURE_S" 1 0 run2 "$EF_RUNTIME"
+          sudo chmod -R a+rwX "$RUNNER_TEMP"/work/data-*
+          for ds in $DATASETS; do
+            dim=${ds%%:*}
+            echo "::group::${ds} run1"; bash .github/thp-bench/host-pair.sh "$dim" run1 0 1; echo "::endgroup::"
+            echo "::group::${ds} run2"; bash .github/thp-bench/host-pair.sh "$dim" run2 1 0; echo "::endgroup::"
+          done
 
       - name: Summarize
         run: |
-          python3 .github/thp-bench/summarize.py "$RUNNER_TEMP/work/data" \
-            "${DOCS} x ${DIM}-dim, EF_RUNTIME ${EF_RUNTIME} (${{ matrix.runner }})" | tee -a "$GITHUB_STEP_SUMMARY"
-          grep -q "'rollup_AnonHugePages_kB': [1-9]" "$RUNNER_TEMP"/work/data/pair/thp-B-*.txt \
-            || { echo "::error::candidate has no AnonHugePages; THP was not applied"; exit 1; }
+          for ds in $DATASETS; do
+            dim=${ds%%:*}; docs=${ds##*:}; d="$RUNNER_TEMP/work/data-$dim"
+            python3 .github/thp-bench/summarize.py "$d" \
+              "${docs} x ${dim}-dim, EF_RUNTIME ${EF_RUNTIME} (${{ matrix.runner }})" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -q "'rollup_AnonHugePages_kB': [1-9]" "$d"/pair/thp-B-*.txt \
+              || { echo "::error::${ds}: candidate has no AnonHugePages; THP was not applied"; exit 1; }
+          done
           grep -h "thp_fault" /proc/vmstat
 
       - name: Print server logs on failure
         if: failure()
         run: |
-          for f in "$RUNNER_TEMP"/work/data/server-*.log "$RUNNER_TEMP"/work/data/pair/server-*.log; do
+          for f in "$RUNNER_TEMP"/work/data-*/server-*.log "$RUNNER_TEMP"/work/data-*/pair/server-*.log; do
             [ -f "$f" ] || continue
             echo "::group::$f (last 100 lines)"; tail -100 "$f"; echo "::endgroup::"
           done
@@ -215,6 +254,6 @@ jobs:
         with:
           name: thp-bench-results-${{ matrix.runner }}
           path: |
-            ${{ runner.temp }}/work/data/pair/
-            ${{ runner.temp }}/work/data/server-*.log
+            ${{ runner.temp }}/work/data-*/pair/
+            ${{ runner.temp }}/work/data-*/server-*.log
           retention-days: 90

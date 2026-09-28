@@ -37,6 +37,7 @@ def run(dur, rec):
         i += 1
 run(warm, None)
 for c in (A, B): c.cmd("CONFIG", "RESETSTAT")
+open(out + ".measuring", "w").close()  # lets an external profiler start with the measured window
 pairs = []; run(meas, pairs)
 def pct(v, q): return v[min(len(v)-1, int(q*len(v)))]
 def stats(v):
