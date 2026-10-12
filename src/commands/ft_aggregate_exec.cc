@@ -282,9 +282,16 @@ absl::Status SortBy::Execute(RecordSet &records) const {
           break;
         }
       }
-      heap.push(records.pop_front().release());
-      auto top = RecordPtr(heap.top());  // no leak....
-      heap.pop();
+      // The top of the heap is the worst record kept so far. A candidate that
+      // does not sort ahead of it would be pushed only to be popped again, so
+      // drop it after one comparison. The heap is empty only for MAX 0, which
+      // keeps nothing.
+      auto candidate = records.pop_front();
+      if (!heap.empty() && sorter(candidate.get(), heap.top())) {
+        auto top = RecordPtr(heap.top());  // no leak....
+        heap.pop();
+        heap.push(candidate.release());
+      }
     }
     // Drained even when cancelled: the heap holds raw pointers this function
     // owns, so leaving early without handing them back would leak them. On the

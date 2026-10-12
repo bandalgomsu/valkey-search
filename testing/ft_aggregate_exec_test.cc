@@ -289,6 +289,41 @@ TEST_F(AggregateExecTest, SortTest) {
   }
 }
 
+// The bounded heap keeps the best MAX records when ties straddle the boundary
+// and the input is in no particular order.
+TEST_F(AggregateExecTest, SortByMaxKeepsBestWithTies) {
+  const std::vector<double> values{5, 1, 3, 1, 4, 3, 2, 5, 3, 0, 2};
+  for (auto asc : {true, false}) {
+    auto param =
+        MakeStages(asc ? "SORTBY 2 @n1 ASC MAX 4" : "SORTBY 2 @n1 DESC MAX 4");
+    RecordSet records(nullptr);
+    for (size_t i = 0; i < values.size(); ++i) {
+      auto rec = std::make_unique<Record>(2);
+      rec->fields_[0] = expr::Value(values[i]);
+      rec->fields_[1] = expr::Value(double(i));
+      records.emplace_back(std::move(rec));
+    }
+    EXPECT_TRUE(param->stages_[0]->Execute(records).ok());
+    std::vector<double> got;
+    for (auto &r : records) {
+      got.push_back(r->fields_[0].GetDouble());
+    }
+    std::vector<double> expected =
+        asc ? std::vector<double>{0, 1, 1, 2} : std::vector<double>{5, 5, 4, 3};
+    EXPECT_EQ(got, expected) << (asc ? "ASC" : "DESC");
+  }
+}
+
+// MAX 0 can reach Execute when the sortby_max_follows_limit compatibility fix
+// is off. It keeps nothing and must not touch the empty heap.
+TEST_F(AggregateExecTest, SortByMaxZeroKeepsNothing) {
+  auto param = MakeStages("SORTBY 2 @n1 ASC");
+  dynamic_cast<SortBy *>(param->stages_[0].get())->max_ = 0;
+  auto records = MakeData(10);
+  EXPECT_TRUE(param->stages_[0]->Execute(records).ok());
+  EXPECT_TRUE(records.empty());
+}
+
 TEST_F(AggregateExecTest, GroupTest) {
   struct Testcase {
     std::string text_;
