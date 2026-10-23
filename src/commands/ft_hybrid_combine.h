@@ -54,8 +54,9 @@ class ArmScoreRef : public expr::Expression::AttributeReference {
 // CompileContext for a COMBINE FUNCTION expression. Resolves `@<alias>`
 // references to per-arm score slots. Each arm is reachable via its
 // YIELD_SCORE_AS alias (if any) and via the positional default
-// `@__arm<i>_score`; the two-arm FT.HYBRID also exposes `@__search_score`
-// (arm 0) and `@__vector_score` (arm 1). PARAMS are not supported.
+// `@__arm<i>_score`; the SEARCH then VSIM shape also exposes
+// `@__search_score` (arm 0) and `@__vector_score` (arm 1). PARAMS are not
+// supported.
 class CombineFunctionContext : public expr::Expression::CompileContext {
  public:
   absl::flat_hash_map<std::string, size_t> alias_to_arm;

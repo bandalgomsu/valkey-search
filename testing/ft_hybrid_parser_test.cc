@@ -112,6 +112,61 @@ class FTHybridParserTest : public ValkeySearchTest {
   std::vector<vmsdk::UniqueValkeyString> argv_;
 };
 
+TEST_F(FTHybridParserTest, MultiArmShapes) {
+  for (const auto &args : std::vector<std::vector<std::string>>{
+           {"SEARCH", "*", "SEARCH", "*"},
+           {"VSIM", "@vector", "$q", "VSIM", "@vector", "$q"},
+           {"VSIM", "@vector", "$q", "SEARCH", "*", "VSIM", "@vector", "$q",
+            "FILTER", "@n:[0 10]", "SEARCH", "@n:[1 5]", "VSIM", "@vector",
+            "$q", "FILTER", "@n:[20 30]"}}) {
+    auto result = Parse(args);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_TRUE((*result)->agg->addscores_);
+    EXPECT_EQ((*result)->fusion.method, FusionConfig::Method::kRRF);
+    EXPECT_EQ((*result)->per_arm_score_is_distance.size(),
+              (*result)->arms.size());
+  }
+}
+
+TEST_F(FTHybridParserTest, MultiArmLimitsAndFusionValidation) {
+  EXPECT_FALSE(Parse({"SEARCH", "*"}).ok());
+  EXPECT_FALSE(Parse({"SEARCH", "*", "SEARCH", "*", "SEARCH", "*", "SEARCH",
+                      "*", "SEARCH", "*", "SEARCH", "*"})
+                   .ok());
+  EXPECT_FALSE(
+      Parse({"SEARCH", "*", "SEARCH", "*", "COMBINE", "LINEAR", "0"}).ok());
+  EXPECT_FALSE(
+      Parse({"VSIM", "@vector", "$q", "SEARCH", "*=>[KNN 2 @vector $q]"}).ok());
+  // Reversing the original shape loses LINEAR.
+  EXPECT_FALSE(
+      Parse({"VSIM", "@vector", "$q", "SEARCH", "*", "COMBINE", "LINEAR", "0"})
+          .ok());
+}
+
+TEST_F(FTHybridParserTest, MultiArmFunctionUsesPositionalAndArmAliases) {
+  auto params = Parse({"VSIM", "@vector", "$q", "YIELD_SCORE_AS", "v", "SEARCH",
+                       "*", "SEARCH", "@n:[1 5]", "COMBINE", "FUNCTION", "2",
+                       "EXPR", "@v + @__arm1_score + @__arm2_score"});
+  ASSERT_TRUE(params.ok()) << params.status();
+  EXPECT_EQ((*params)->fusion.method, FusionConfig::Method::kFunction);
+  // Outside the SEARCH then VSIM shape these names would point at the wrong
+  // arms, so they are not defined.
+  for (const char *legacy : {"@__search_score", "@__vector_score"}) {
+    EXPECT_FALSE(Parse({"VSIM", "@vector", "$q", "SEARCH", "*", "COMBINE",
+                        "FUNCTION", "2", "EXPR", legacy})
+                     .ok())
+        << legacy;
+  }
+}
+
+TEST_F(FTHybridParserTest, MultiArmDuplicateScoreAliasIsRejected) {
+  auto params = Parse({"VSIM", "@vector", "$q", "YIELD_SCORE_AS", "s", "VSIM",
+                       "@vector", "$q", "YIELD_SCORE_AS", "s"});
+  ASSERT_FALSE(params.ok());
+  EXPECT_THAT(params.status().message(),
+              ::testing::HasSubstr("is used by more than one clause"));
+}
+
 // ---------------------------------------------------------------------
 // K
 // ---------------------------------------------------------------------

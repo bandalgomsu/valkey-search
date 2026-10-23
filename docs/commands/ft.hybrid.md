@@ -1,18 +1,19 @@
-The `FT.HYBRID` command runs two searches over one index and combines their results into a single ranked list.
+The `FT.HYBRID` command runs two to five independent searches over one index and combines their results into a single ranked list.
 
-The first search is the `SEARCH` arm: a text, tag or numeric query, scored for relevance the way `FT.SEARCH` scores one. The second is the `VSIM` arm: a vector similarity search, scored by distance. Each arm ranks its own matches independently.
+Each arm is either `SEARCH` (text, tag or numeric relevance search) or `VSIM` (vector similarity search). Arms may appear in any order, including only SEARCH arms or only VSIM arms. Each arm ranks its own matches independently. RRF adds the rank contributions of each document across all arms; an absent document contributes zero for that arm.
 
-The two ranked lists are then fused into one. Fusion is what makes this a hybrid search rather than two searches: a document that both arms found is rewarded for appearing in both, and the `COMBINE` clause decides how the two arms' scores are weighed against each other.
+RRF, the default, and FUNCTION work with every arm combination. LINEAR weighs one SEARCH arm against one VSIM arm, so it requires the original two-arm `SEARCH ... VSIM ...` form. Use distinct per-arm score aliases to expose each contribution; an alias used by more than one arm is rejected.
 
 The fused list is then fed through the same processing stages as `FT.AGGREGATE`, so the result can be projected, filtered, grouped, sorted and trimmed before it is returned.
 
 ```
 FT.HYBRID <index-name>
-    SEARCH <query> [SCORER <scorer>] [YIELD_SCORE_AS <alias>]
-    VSIM <field> <vector> [KNN <count> [K <k>] [EF_RUNTIME <ef>] [SHARD_K_RATIO <ratio>]]
+    ( SEARCH <query> [SCORER <scorer>] [YIELD_SCORE_AS <alias>]
+    | VSIM <field> <vector> [KNN <count> [K <k>] [EF_RUNTIME <ef>] [SHARD_K_RATIO <ratio>]]
                           [FILTER [<count>] <expression>
                             [POLICY (ADHOC | BATCHES [BATCH_SIZE <n>])]]
                           [YIELD_SCORE_AS <alias>]
+    ){2,5}
     [COMBINE
       ( RRF      <count> [CONSTANT <c>] [WINDOW <w>] [YIELD_SCORE_AS <alias>]
       | LINEAR   <count> [ALPHA <a> BETA <b>] [WINDOW <w>] [YIELD_SCORE_AS <alias>]
@@ -32,18 +33,18 @@ FT.HYBRID <index-name>
     )*
 ```
 
-- `<index-name>` (required): The index to query. Both arms search the same index.
-- `SEARCH <query>` (required): The non-vector arm. `<query>` is any query the search parser accepts, see [Search - query language](../topics/search-query.md). A vector query is rejected here — the vector search is the `VSIM` clause's job.
+- `<index-name>` (required): The index to query. Every arm searches the same index.
+- `SEARCH <query>` (arm): The non-vector arm. `<query>` is any query the search parser accepts, see [Search - query language](../topics/search-query.md). A vector query is rejected here — the vector search is the `VSIM` clause's job.
   - `SCORER <scorer>` (optional): The relevance scorer for this arm. The only supported scorer is `BM25STD`, which is also the default.
   - `YIELD_SCORE_AS <alias>` (optional): Emits this arm's score under `<alias>`, making it available to `COMBINE FUNCTION` and to the processing stages.
-- `VSIM <field> <vector>` (required): The vector arm. `<field>` is a declared vector attribute and `<vector>` is a binary blob, supplied through `PARAMS`.
+- `VSIM <field> <vector>` (arm): The vector arm. `<field>` is a declared vector attribute and `<vector>` is a binary blob, supplied through `PARAMS`.
   - `KNN <count> [K <k>] [EF_RUNTIME <ef>] [SHARD_K_RATIO <ratio>]` (optional): The vector search parameters. `<count>` is a count of the arguments that follow within the block, not a count of parameters. `K` is the number of nearest neighbors to retrieve, between 1 and 10000, and defaults to 10. Omitting the whole block, or writing `KNN 0`, is the same as taking every default. `EF_RUNTIME` tunes the HNSW search breadth. `SHARD_K_RATIO` is accepted for compatibility and ignored.
   - `FILTER [<count>] <expression> [POLICY ...]` (optional): Restricts which documents the vector search considers. The filter decides membership only; this arm's score remains the vector distance. Without `POLICY`, the existing count-optional form remains supported. A policy must be inside a counted FILTER block, where `<count>` includes the expression and every policy token. `POLICY ADHOC` forces exact filter-first execution. `POLICY BATCHES` forces vector-search-first execution with inline filtering. A wildcard expression (`FILTER 3 * POLICY ...`) has no restriction to apply, so both policies use standard unfiltered KNN, matching Redis. Policy values are literal command tokens, not `PARAMS` references. `EF_RUNTIME` is rejected with `ADHOC` and accepted with `BATCHES`. `BATCH_SIZE <n>` is accepted only after `POLICY BATCHES`; its value remains unsupported and is ignored. See [Search - query language](../topics/search-query.md)
   - `YIELD_SCORE_AS <alias>` (optional): As for the `SEARCH` arm.
-- `COMBINE` (optional): How the two arms' results are fused. Defaults to `RRF` with its own defaults when the clause is absent. In every form, `<count>` is a count of the arguments that follow within the clause, not a count of sub-arguments; sub-arguments may appear in any order. See [Fusion methods](#fusion-methods) below.
+- `COMBINE` (optional): How the arms' results are fused. Defaults to `RRF` with its own defaults when the clause is absent. In every form, `<count>` is a count of the arguments that follow within the clause, not a count of sub-arguments; sub-arguments may appear in any order. See [Fusion methods](#fusion-methods) below.
 - `DIALECT <dialect>` (optional): Specifies your dialect. The only supported dialect is 2.
 - `LOAD * | LOAD <count> <field> [AS <alias>] [...]` (optional): Which fields of the matched keys are loaded into the working set, exactly as for `FT.AGGREGATE`. Without a `LOAD` clause the result carries the key, the fused score, and any per-arm scores that were named. `AS <alias>` requires `search.emulate-release` to be at least `1.3.0`; below that the `AS` keyword is read as another field name and the load fails.
-- `PARAMS <count> <name> <value> [...]` (optional): `<count>` is the number of arguments, i.e. twice the number of name/value pairs. Used to supply the `VSIM` query vector. A `$name` reference inside either arm's query text is not substituted — the same limitation `FT.SEARCH` and `FT.AGGREGATE` have.
+- `PARAMS <count> <name> <value> [...]` (optional): `<count>` is the number of arguments, i.e. twice the number of name/value pairs. Used to supply the `VSIM` query vector. A `$name` reference inside any arm's query text is not substituted — the same limitation `FT.SEARCH` and `FT.AGGREGATE` have.
 - `TIMEOUT <timeout>` (optional): A timeout for the command, in milliseconds, between 1 and 60000.
 - `WITHCURSOR [COUNT <count>] [MAXIDLE <maxidle>]` (optional): Returns at most `<count>` records and saves the remaining records in a cursor, which is read with [`FT.CURSOR`](ft.cursor.md), exactly as for [`FT.AGGREGATE`](ft.aggregate.md). `<count>` must be between 1 and `search.cursor-max-count`, the default is 1000. `<maxidle>` is the number of milliseconds the cursor may go unread before it is destroyed; it must be between 1 and `search.cursor-max-idle-ms`, the default is 300000. `WITHCURSOR` may appear anywhere among the clauses that follow `SEARCH`, `VSIM` and `COMBINE`, and ends any of those three clauses the way `LOAD` does. If it is given more than once, the last one is used. A cursor is no exception to the cancellation rules: a query cancelled by its `TIMEOUT` is an error, as it is without `WITHCURSOR`.
 - `APPLY`, `FILTER`, `GROUPBY`, `LIMIT`, `SORTBY` (optional): The `FT.AGGREGATE` processing stages, applied to the fused list in the order written. See [FT.AGGREGATE](ft.aggregate.md#processing-stages) for what each stage does.
@@ -68,7 +69,7 @@ Fusion sees each arm's results ranked best-first, and every arm's score in the s
 COMBINE RRF <count> [CONSTANT <c>] [WINDOW <w>] [YIELD_SCORE_AS <alias>]
 ```
 
-Reciprocal Rank Fusion scores a document by its _rank_ in each arm rather than by the arm's score, which makes it insensitive to the two arms producing scores on entirely different scales. A document at rank `r` in an arm contributes `1 / (c + r + 1)`, and the contributions from both arms are summed.
+Reciprocal Rank Fusion scores a document by its _rank_ in each arm rather than by the arm's score, which makes it insensitive to the arms producing scores on entirely different scales. A document at rank `r` in an arm contributes `1 / (c + r + 1)`, and the contributions from all arms are summed.
 
 - `CONSTANT <c>` (optional, default `60`): The `c` above. A larger constant flattens the difference between ranks. Must be a non-negative finite number; fractional values are honored.
 - `WINDOW <w>` (optional, default `20`): How many of each arm's top results take part in fusion.
@@ -104,7 +105,7 @@ The fused score is whatever your expression computes from the arms' scores. This
 - `EXPR <expression>` (required): An expression over the per-arm scores. See [Search - expressions](../topics/search-expressions.md) for the syntax.
 - `WINDOW <w>` (optional): Defaults to the widest window allowed rather than to 20, because a user expression is normally expected to see every candidate.
 
-Each arm's score is reachable from the expression three ways: by the arm's own `YIELD_SCORE_AS` alias, by position as `@__arm0_score` and `@__arm1_score`, and — for the standard two-arm shape — as `@__search_score` and `@__vector_score`.
+Each arm's score is reachable from the expression three ways: by the arm's own `YIELD_SCORE_AS` alias, by position as `@__arm0_score`, `@__arm1_score` and so on in clause order, and — only for the original `SEARCH ... VSIM ...` shape — as `@__search_score` and `@__vector_score`.
 
 ```
 FT.HYBRID idx
@@ -118,7 +119,7 @@ An arm that did not return a given document has no score for it, and an expressi
 
 ## WINDOW
 
-`WINDOW` bounds how many of each arm's top results take part in fusion. It is a per-arm count, so with two arms the fused list can hold up to twice the window before the processing stages run.
+`WINDOW` bounds how many of each arm's top results take part in fusion. It is a per-arm count, so with N arms the fused list can hold up to N times the window before the processing stages run.
 
 `WINDOW 0` means "as wide as allowed" and resolves to the ceiling set by the `search.max-combine-window` configuration, which defaults to 1,000,000. Values above that ceiling are rejected.
 
@@ -138,4 +139,20 @@ The fused score is emitted under `__score` unless `COMBINE ... YIELD_SCORE_AS` n
 - **`POLICY` is active inside a counted VSIM `FILTER`.** `ADHOC` forces exact filter-first execution and `BATCHES` forces vector-search-first execution with inline filtering. Other values, duplicate declarations, and placement outside the counted FILTER block are rejected.
 - **`BATCH_SIZE` is accepted but ignored.** It is valid only after `POLICY BATCHES`; fixed-size batch iteration is tracked separately.
 - **`NOCONTENT` is rejected.** `FT.HYBRID` always returns records; a query wanting keys only can ask for no `LOAD` clause.
-- **`FT.HYBRID` cannot run inside `MULTI`/`EXEC` or a Lua script**, and is unavailable when the reader thread pool is disabled. All three force synchronous execution, which cannot revalidate the two arms' results against concurrent writes.
+- **`FT.HYBRID` cannot run inside `MULTI`/`EXEC` or a Lua script**, and is unavailable when the reader thread pool is disabled. All three force synchronous execution, which cannot revalidate the arms' results against concurrent writes.
+
+## Multiple search arms
+
+Repeat SEARCH or VSIM before COMBINE and the aggregate pipeline, with two to five arms total. This example combines two vector searches and a text search:
+
+```text
+FT.HYBRID products
+  VSIM @title_vec $qt KNN 2 K 100
+  VSIM @image_vec $qi KNN 2 K 100
+  SEARCH "@title:shoes"
+  COMBINE RRF 4 CONSTANT 60 WINDOW 100
+  PARAMS 4 qt <title_vector_blob> qi <image_vector_blob>
+  LIMIT 0 10
+```
+
+K limits the candidates retrieved by each vector arm; WINDOW limits how many ranked results from each arm contribute to fusion. LIMIT applies to the final fused output. More arms increase query work and candidate memory; RRF does not require evaluating every document against every arm.

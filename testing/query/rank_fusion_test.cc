@@ -114,6 +114,21 @@ using LinearTest = vmsdk::ValkeyTest;
 
 // ---------------------------- RRF basic shapes ----------------------------
 
+TEST_F(RRFTest, FiveArmsWithOverlapEmptyResultsAndWindows) {
+  auto a = Vec(N("doc:1", 0.1f), N("doc:2", 0.2f));
+  auto b = Vec(N("doc:2", 0.1f), N("doc:1", 0.2f));
+  std::vector<indexes::Neighbor> empty;
+  auto fused = RRF({{.neighbors = &a},
+                    {.neighbors = &b},
+                    {.neighbors = &empty},
+                    {.neighbors = &a, .window = 1},
+                    {.neighbors = &b, .window = 1}});
+  ASSERT_EQ(fused.size(), 2u);
+  EXPECT_NEAR(Find(fused, "doc:1")->score, 2.0 / 61 + 1.0 / 62, 1e-7);
+  EXPECT_NEAR(Find(fused, "doc:2")->score, 2.0 / 61 + 1.0 / 62, 1e-7);
+  EXPECT_EQ(fused.front().external_id->Str(), "doc:1");
+}
+
 TEST_F(RRFTest, DisjointArmsContributeIndependently) {
   auto arm0 = Vec(N("doc:1", 0.1f), N("doc:2", 0.2f));
   auto arm1 = Vec(N("doc:3", 0.3f), N("doc:4", 0.4f));

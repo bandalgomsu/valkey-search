@@ -99,9 +99,7 @@ class MultiArmShim : public SearchParameters {
 // pipeline parameters (populated by the FT.HYBRID parser in Phase 4), the
 // per-arm raw results (populated by the tracker), and the fused SearchResult.
 //
-// FT.HYBRID is the only command that uses MultiSearchParameters in V1; the N=2
-// shape is concrete (arms[0]=SEARCH, arms[1]=VSIM) but the underlying machinery
-// generalizes to N arms.
+// FT.HYBRID accepts two to five SEARCH or VSIM arms in any order.
 struct MultiSearchParameters {
   // ----- envelope (shared dispatch state) -----
   uint32_t db_num{0};
@@ -133,8 +131,7 @@ struct MultiSearchParameters {
   bool output_score_name_explicit{false};
 
   // ----- arms (each is a MultiArmShim, which IS-A SearchParameters; the shim
-  //       carries the tracker back-pointer set at dispatch time. For FT.HYBRID
-  //       V1, size()==2) -----
+  //       carries the tracker back-pointer set at dispatch time) -----
   std::vector<std::unique_ptr<MultiArmShim>> arms;
   std::vector<std::optional<std::string>> per_arm_score_alias;
   // True for each arm whose Neighbor::score is a raw vector distance rather

@@ -11,11 +11,11 @@
         "Hybrid search combining text/filter and vector arms"
       ]
     ],
-    "arity": -7,
+    "arity": -6,
     "group": "search",
     "module_since": "1.3.0-RC1",
-    "summary": "Performs hybrid search combining a text/filter arm with a vector arm, fuses results via RRF, LINEAR or a user-supplied FUNCTION, and feeds the fused list through the FT.AGGREGATE post-pipeline.",
-    "complexity": "O(N+M) where N is the complexity of the SEARCH arm and M is the complexity of the VSIM arm.",
+    "summary": "Runs two to five independent SEARCH or VSIM arms and fuses their ranked results. RRF and FUNCTION work with any arm combination; LINEAR requires one SEARCH followed by one VSIM.",
+    "complexity": "The sum of the search costs of all arms, plus result fusion and aggregation.",
     "arguments": [
       {
         "name": "index",
@@ -23,193 +23,200 @@
         "key_spec_index": 0
       },
       {
-        "name": "search_clause",
-        "type": "block",
+        "name": "search_arms",
+        "type": "oneof",
+        "multiple": true,
         "arguments": [
           {
-            "name": "search_token",
-            "type": "pure-token",
-            "token": "SEARCH"
-          },
-          {
-            "name": "query",
-            "type": "string"
-          },
-          {
-            "name": "scorer",
+            "name": "search_clause",
             "type": "block",
-            "optional": true,
             "arguments": [
               {
-                "name": "scorer_token",
+                "name": "search_token",
                 "type": "pure-token",
-                "token": "SCORER"
+                "token": "SEARCH"
               },
               {
-                "name": "scorer_name",
+                "name": "query",
                 "type": "string"
-              }
-            ]
-          },
-          {
-            "name": "search_yield_score_as",
-            "type": "block",
-            "optional": true,
-            "arguments": [
-              {
-                "name": "yield_token",
-                "type": "pure-token",
-                "token": "YIELD_SCORE_AS"
               },
               {
-                "name": "search_score_alias",
-                "type": "string"
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "name": "vsim_clause",
-        "type": "block",
-        "arguments": [
-          {
-            "name": "vsim_token",
-            "type": "pure-token",
-            "token": "VSIM"
-          },
-          {
-            "name": "vector_field",
-            "type": "string"
-          },
-          {
-            "name": "vector_param",
-            "type": "string"
-          },
-          {
-            "name": "knn_block",
-            "type": "block",
-            "optional": true,
-            "arguments": [
-              {
-                "name": "knn_token",
-                "type": "pure-token",
-                "token": "KNN"
-              },
-              {
-                "name": "knn_count",
-                "type": "integer"
-              },
-              {
-                "name": "k",
+                "name": "scorer",
                 "type": "block",
                 "optional": true,
                 "arguments": [
                   {
-                    "name": "k_token",
+                    "name": "scorer_token",
                     "type": "pure-token",
-                    "token": "K"
+                    "token": "SCORER"
                   },
                   {
-                    "name": "k_value",
+                    "name": "scorer_name",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "name": "search_yield_score_as",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                  {
+                    "name": "yield_token",
+                    "type": "pure-token",
+                    "token": "YIELD_SCORE_AS"
+                  },
+                  {
+                    "name": "search_score_alias",
+                    "type": "string"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "vsim_clause",
+            "type": "block",
+            "arguments": [
+              {
+                "name": "vsim_token",
+                "type": "pure-token",
+                "token": "VSIM"
+              },
+              {
+                "name": "vector_field",
+                "type": "string"
+              },
+              {
+                "name": "vector_param",
+                "type": "string"
+              },
+              {
+                "name": "knn_block",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                  {
+                    "name": "knn_token",
+                    "type": "pure-token",
+                    "token": "KNN"
+                  },
+                  {
+                    "name": "knn_count",
                     "type": "integer"
-                  }
-                ]
-              },
-              {
-                "name": "ef_runtime",
-                "type": "block",
-                "optional": true,
-                "arguments": [
-                  {
-                    "name": "ef_runtime_token",
-                    "type": "pure-token",
-                    "token": "EF_RUNTIME"
                   },
                   {
-                    "name": "ef_runtime_value",
-                    "type": "integer"
-                  }
-                ]
-              },
-              {
-                "name": "shard_k_ratio",
-                "type": "block",
-                "optional": true,
-                "arguments": [
-                  {
-                    "name": "shard_k_ratio_token",
-                    "type": "pure-token",
-                    "token": "SHARD_K_RATIO"
-                  },
-                  {
-                    "name": "shard_k_ratio_value",
-                    "type": "double"
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "name": "vsim_filter",
-            "type": "block",
-            "optional": true,
-            "arguments": [
-              {
-                "name": "vsim_filter_token",
-                "type": "pure-token",
-                "token": "FILTER"
-              },
-              {
-                "name": "vsim_filter_count",
-                "type": "integer",
-                "optional": true
-              },
-              {
-                "name": "vsim_filter_expression",
-                "type": "string"
-              },
-              {
-                "name": "vsim_policy",
-                "type": "block",
-                "optional": true,
-                "arguments": [
-                  {
-                    "name": "vsim_policy_token",
-                    "type": "pure-token",
-                    "token": "POLICY"
-                  },
-                  {
-                    "name": "vsim_policy_value",
-                    "type": "oneof",
+                    "name": "k",
+                    "type": "block",
+                    "optional": true,
                     "arguments": [
                       {
-                        "name": "adhoc",
+                        "name": "k_token",
                         "type": "pure-token",
-                        "token": "ADHOC"
+                        "token": "K"
                       },
                       {
-                        "name": "batches",
-                        "type": "block",
+                        "name": "k_value",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "ef_runtime",
+                    "type": "block",
+                    "optional": true,
+                    "arguments": [
+                      {
+                        "name": "ef_runtime_token",
+                        "type": "pure-token",
+                        "token": "EF_RUNTIME"
+                      },
+                      {
+                        "name": "ef_runtime_value",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "shard_k_ratio",
+                    "type": "block",
+                    "optional": true,
+                    "arguments": [
+                      {
+                        "name": "shard_k_ratio_token",
+                        "type": "pure-token",
+                        "token": "SHARD_K_RATIO"
+                      },
+                      {
+                        "name": "shard_k_ratio_value",
+                        "type": "double"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "vsim_filter",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                  {
+                    "name": "vsim_filter_token",
+                    "type": "pure-token",
+                    "token": "FILTER"
+                  },
+                  {
+                    "name": "vsim_filter_count",
+                    "type": "integer",
+                    "optional": true
+                  },
+                  {
+                    "name": "vsim_filter_expression",
+                    "type": "string"
+                  },
+                  {
+                    "name": "vsim_policy",
+                    "type": "block",
+                    "optional": true,
+                    "arguments": [
+                      {
+                        "name": "vsim_policy_token",
+                        "type": "pure-token",
+                        "token": "POLICY"
+                      },
+                      {
+                        "name": "vsim_policy_value",
+                        "type": "oneof",
                         "arguments": [
                           {
-                            "name": "batches_token",
+                            "name": "adhoc",
                             "type": "pure-token",
-                            "token": "BATCHES"
+                            "token": "ADHOC"
                           },
                           {
-                            "name": "vsim_batch_size",
+                            "name": "batches",
                             "type": "block",
-                            "optional": true,
                             "arguments": [
                               {
-                                "name": "vsim_batch_size_token",
+                                "name": "batches_token",
                                 "type": "pure-token",
-                                "token": "BATCH_SIZE"
+                                "token": "BATCHES"
                               },
                               {
-                                "name": "vsim_batch_size_value",
-                                "type": "integer"
+                                "name": "vsim_batch_size",
+                                "type": "block",
+                                "optional": true,
+                                "arguments": [
+                                  {
+                                    "name": "vsim_batch_size_token",
+                                    "type": "pure-token",
+                                    "token": "BATCH_SIZE"
+                                  },
+                                  {
+                                    "name": "vsim_batch_size_value",
+                                    "type": "integer"
+                                  }
+                                ]
                               }
                             ]
                           }
@@ -218,22 +225,22 @@
                     ]
                   }
                 ]
-              }
-            ]
-          },
-          {
-            "name": "vsim_yield_score_as",
-            "type": "block",
-            "optional": true,
-            "arguments": [
-              {
-                "name": "vsim_yield_score_as_token",
-                "type": "pure-token",
-                "token": "YIELD_SCORE_AS"
               },
               {
-                "name": "vsim_score_alias",
-                "type": "string"
+                "name": "vsim_yield_score_as",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                  {
+                    "name": "vsim_yield_score_as_token",
+                    "type": "pure-token",
+                    "token": "YIELD_SCORE_AS"
+                  },
+                  {
+                    "name": "vsim_score_alias",
+                    "type": "string"
+                  }
+                ]
               }
             ]
           }

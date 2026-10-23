@@ -6,6 +6,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -617,7 +618,7 @@ absl::Status ParseVsimClause(MultiSearchParameters &env,
 // sub-argument is optional, and each is rejected by the methods that do not
 // take it.
 absl::Status ParseCombineClause(MultiSearchParameters &env,
-                                vmsdk::ArgsIterator &itr) {
+                                vmsdk::ArgsIterator &itr, bool legacy_shape) {
   VMSDK_ASSIGN_OR_RETURN(auto method_sv, itr.GetStringView());
   itr.Next();
   uint32_t inner_count = 0;
@@ -716,8 +717,9 @@ absl::Status ParseCombineClause(MultiSearchParameters &env,
       // COMBINE FUNCTION EXPR "<expression>". Compile the expression against
       // a context that maps every arm's score to a reference. Each arm is
       // reachable via its YIELD_SCORE_AS alias (if any), the positional
-      // default @__arm<i>_score, and (for the two-arm SEARCH/VSIM shape)
-      // @__search_score / @__vector_score.
+      // default @__arm<i>_score, and (only for the original SEARCH then VSIM
+      // shape, where they name the right arms) @__search_score /
+      // @__vector_score.
       VMSDK_ASSIGN_OR_RETURN(auto expr_sv, inner_itr.GetStringView());
       inner_itr.Next();
       CombineFunctionContext cctx;
@@ -728,10 +730,8 @@ absl::Status ParseCombineClause(MultiSearchParameters &env,
           cctx.alias_to_arm[*env.per_arm_score_alias[i]] = i;
         }
       }
-      if (env.arms.size() >= 1) {
+      if (legacy_shape) {
         cctx.alias_to_arm["__search_score"] = 0;
-      }
-      if (env.arms.size() >= 2) {
         cctx.alias_to_arm["__vector_score"] = 1;
       }
       VMSDK_ASSIGN_OR_RETURN(env.combine_function,
@@ -780,20 +780,56 @@ absl::Status ParseCombineClause(MultiSearchParameters &env,
 
 absl::Status ParseFtHybridCommand(MultiSearchParameters &env,
                                   vmsdk::ArgsIterator &itr) {
+  constexpr size_t kMaxArms = 5;
   bool vsim_uses_range = false;
-  // The VSIM arm's pre-filter and the query string synthesized from it. Held
-  // here because the arm keeps a string_view into the latter and both have to
-  // outlive the parse.
-  std::string vsim_filter;
-  std::string vsim_query_string;
-  // 1. SEARCH (mandatory, must come first)
-  VMSDK_RETURN_IF_ERROR(ParseSearchClause(env, itr));
-  // 2. VSIM (mandatory, must follow)
-  VMSDK_RETURN_IF_ERROR(ParseVsimClause(env, itr, &vsim_uses_range,
-                                        &vsim_filter, &vsim_query_string));
-  // 3. Optional COMBINE
+  // Stable storage: filtered VSIM arms keep views until PostParseQueryString.
+  std::array<std::string, kMaxArms> filters;
+  std::array<std::string, kMaxArms> query_strings;
+  std::array<bool, kMaxArms> is_vsim{};
+  while (itr.HasNext()) {
+    VMSDK_ASSIGN_OR_RETURN(auto keyword, itr.GetStringView());
+    const bool vector_arm = absl::EqualsIgnoreCase(keyword, kVsimKw);
+    if (!vector_arm && !absl::EqualsIgnoreCase(keyword, kSearchKw)) {
+      break;
+    }
+    const size_t i = env.arms.size();
+    if (i == kMaxArms) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "FT.HYBRID supports at most ", kMaxArms, " search clauses"));
+    }
+    is_vsim[i] = vector_arm;
+    if (vector_arm) {
+      bool uses_range = false;
+      VMSDK_RETURN_IF_ERROR(ParseVsimClause(env, itr, &uses_range, &filters[i],
+                                            &query_strings[i]));
+      vsim_uses_range |= uses_range;
+    } else {
+      VMSDK_RETURN_IF_ERROR(ParseSearchClause(env, itr));
+    }
+  }
+  if (env.arms.size() < 2) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("FT.HYBRID requires 2 to ", kMaxArms, " search clauses"));
+  }
+  // Fusion attaches each arm's score under its alias, so a shared alias would
+  // let the later arm silently overwrite the earlier one.
+  absl::flat_hash_set<absl::string_view> arm_aliases;
+  for (const auto &alias : env.per_arm_score_alias) {
+    if (alias.has_value() && !arm_aliases.insert(*alias).second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "YIELD_SCORE_AS `", *alias, "` is used by more than one clause"));
+    }
+  }
+  const bool legacy_shape = env.arms.size() == 2 && !is_vsim[0] && is_vsim[1];
   if (itr.PopIfNextIgnoreCase(kCombineKw)) {
-    VMSDK_RETURN_IF_ERROR(ParseCombineClause(env, itr));
+    // ALPHA/BETA weigh exactly one SEARCH arm against one VSIM arm.
+    VMSDK_ASSIGN_OR_RETURN(auto method, itr.GetStringView());
+    if (!legacy_shape && absl::EqualsIgnoreCase(method, kLinearKw)) {
+      return absl::InvalidArgumentError(
+          "COMBINE LINEAR requires exactly one SEARCH clause followed by one "
+          "VSIM clause");
+    }
+    VMSDK_RETURN_IF_ERROR(ParseCombineClause(env, itr, legacy_shape));
   }
   // 4. Walk remaining tokens. POLICY belongs inside the VSIM FILTER block;
   //    everything else is forwarded to the aggregate-suffix parser via the
@@ -806,15 +842,8 @@ absl::Status ParseFtHybridCommand(MultiSearchParameters &env,
     env.agg->cancellation_token = env.cancellation_token;
     env.agg->timeout_ms = env.timeout_ms;
     env.agg->no_content = false;
-    // Make the aggregate pipeline treat the fused result as a "scored" set so
-    // the score_as -> Neighbor::score plumbing in CreateRecordsFromNeighbors
-    // fires (it gates on AggregateParameters::IsVectorQuery, which checks
-    // whether attribute_alias is non-empty). Reuse the VSIM arm's vector
-    // field; the aggregate code calls index_schema->GetIdentifier on it, so
-    // it must name a real vector index in the schema.
-    if (env.arms.size() > 1 && !env.arms[1]->attribute_alias.empty()) {
-      env.agg->attribute_alias = env.arms[1]->attribute_alias;
-    }
+    // Fused scores are available even when every arm is a SEARCH clause.
+    env.agg->addscores_ = true;
     // Set the score_as on the aggregate the same way ft_aggregate.cc:91 does
     // for plain FT.AGGREGATE — so the post-fusion aggregate pipeline routes
     // the fused score into a known field name. That name is `__score` unless
@@ -1172,10 +1201,10 @@ absl::Status ParseFtHybridCommand(MultiSearchParameters &env,
       // the VSIM clause's K/EF_RUNTIME bounds nor its scoring rules see, so it
       // is refused rather than quietly honoured. PreParseQueryString is what
       // sets attribute_alias from the query string, so this is the first point
-      // at which it can be asked. Only the SEARCH arm is checked: the VSIM arm
+      // at which it can be asked. Only SEARCH arms are checked: a VSIM arm
       // reaches here too when a FILTER rewrote it into a query string, and
       // that one is a vector query by construction.
-      if (arm_index == 0 && arm->IsVectorQuery()) {
+      if (!is_vsim[arm_index] && arm->IsVectorQuery()) {
         return absl::InvalidArgumentError(
             "A vector query is not supported in the SEARCH clause; use VSIM");
       }

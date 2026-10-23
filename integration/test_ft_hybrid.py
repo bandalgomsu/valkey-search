@@ -873,20 +873,20 @@ class TestFtHybridBase(ValkeySearchTestCaseBase):
     # Required-clause + structural rejections.
     # ---------------------------------------------------------------------
 
-    def test_search_clause_required(self):
+    def test_single_vsim_clause_rejected(self):
         client = self.server.get_new_client()
         self.setup_index(client)
-        with pytest.raises(ResponseError, match=r"FT.HYBRID requires SEARCH"):
+        with pytest.raises(ResponseError, match=r"FT.HYBRID requires 2 to 5 search clauses"):
             client.execute_command(
                 "FT.HYBRID", self.INDEX,
                 "VSIM", "@vec", "$q", "KNN", "2", "K", "5",
                 "PARAMS", "2", "q", self.Q,
             )
 
-    def test_vsim_clause_required(self):
+    def test_single_search_clause_rejected(self):
         client = self.server.get_new_client()
         self.setup_index(client)
-        with pytest.raises(ResponseError, match=r"FT.HYBRID requires VSIM"):
+        with pytest.raises(ResponseError, match=r"FT.HYBRID requires 2 to 5 search clauses"):
             client.execute_command(
                 "FT.HYBRID", self.INDEX,
                 "SEARCH", "@title:hello",
